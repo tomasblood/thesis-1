@@ -16,8 +16,22 @@ from typing import Literal, Optional, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
-import pytest
-pytest.importorskip("ot")
+
+try:
+    import ot
+    HAS_OT = True
+except ImportError:
+    ot = None
+    HAS_OT = False
+
+
+def _require_ot():
+    """Raise ImportError if POT is not available."""
+    if not HAS_OT:
+        raise ImportError(
+            "Optimal transport features require the 'pot' package. "
+            "Install with: pip install pot"
+        )
 
 
 
@@ -239,6 +253,7 @@ class TransportAlignment:
         Returns:
             AlignmentResult with transport plan and aligned target
         """
+        _require_ot()
         N_s = Phi_source.shape[0]
         N_t = Phi_target.shape[0]
 
