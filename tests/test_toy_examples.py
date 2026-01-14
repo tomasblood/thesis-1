@@ -8,9 +8,9 @@ on spectral representations.
 Each toy example isolates a specific failure mode of naive approaches and
 demonstrates how the method handles it correctly.
 """
-
-import numpy as np
 import pytest
+pytest.importorskip("ot")
+import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
 from scipy.spatial.distance import pdist, squareform
