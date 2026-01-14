@@ -16,7 +16,11 @@ from typing import Literal, Optional, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
-import ot  # Python Optimal Transport library
+try:
+    import ot  # Python Optimal Transport (POT)
+except ImportError:  # POT is optional
+    ot = None
+
 
 
 @dataclass
