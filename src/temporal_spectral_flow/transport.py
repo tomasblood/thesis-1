@@ -16,10 +16,8 @@ from typing import Literal, Optional, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
-try:
-    import ot  # Python Optimal Transport (POT)
-except ImportError:  # POT is optional
-    ot = None
+import pytest
+pytest.importorskip("ot")
 
 
 

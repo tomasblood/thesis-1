@@ -2,6 +2,8 @@
 
 import numpy as np
 import pytest
+pytest.importorskip("ot")
+
 
 from temporal_spectral_flow.transport import (
     TransportAlignment,

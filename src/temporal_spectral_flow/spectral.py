@@ -149,8 +149,8 @@ class SpectralEmbedding:
         eigenvalues, eigenvectors = eigsh(
             L.astype(np.float64),
             k=n_components,
-            which="SM",  # Smallest magnitude
-            sigma=1e-10,  # Shift to help with numerical stability
+            which="LM",  # Smallest magnitude
+            sigma=0,  # Shift to help with numerical stability
             maxiter=1000,
             tol=1e-8,
         )

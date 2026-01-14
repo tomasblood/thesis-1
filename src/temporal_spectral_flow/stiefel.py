@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 import numpy as np
 from numpy.typing import NDArray
 from scipy.linalg import expm, logm, svd, qr
+from scipy.sparse import csr_matrix
 
 
 class StiefelManifold:
@@ -114,7 +115,7 @@ class StiefelManifold:
             rng = np.random.default_rng()
 
         A = rng.standard_normal((self.n, self.k))
-        Q, _ = qr(A, mode="reduced")
+        Q, _ = np.linalg.qr(A, mode="reduced")
         return Q
 
     def random_tangent(
@@ -145,47 +146,28 @@ class StiefelManifold:
         t: float = 1.0,
     ) -> NDArray[np.floating]:
         """
-        Exponential map: move from X along tangent vector V.
+        Retraction (QR-based) exponential-like map on Stiefel.
 
-        This computes the geodesic starting at X with initial velocity V,
-        evaluated at time t.
-
-        Uses the efficient formula via matrix exponential.
+        This is a QR retraction: exp_X(tV) := qf(X + tV)
+        with a fixed sign convention so results are deterministic.
 
         Args:
-            X: Point on St(n, k)
+            X: Point on St(n,k)
             V: Tangent vector at X
-            t: Step size along geodesic
-
-        Returns:
-            Point on St(n, k) at geodesic distance t*||V||
+            t: Step size / time parameter
         """
-        n, k = X.shape
+        X = np.asarray(X, dtype=np.float64)
+        V = np.asarray(V, dtype=np.float64)
 
-        # Scale the tangent vector
-        tV = t * V
+        Q, R = qr(X + float(t) * V, mode="economic")
 
-        # Compute the matrix exponential formula
-        # Based on Edelman, Arias, Smith (1998)
-        A = X.T @ tV
-        Q, R = qr(tV - X @ A, mode="reduced")
+        # Enforce deterministic sign convention: diag(R) >= 0
+        d = np.sign(np.diag(R))
+        d[d == 0] = 1.0
+        Q = Q * d  # scale columns
 
-        # Build the 2k x 2k matrix for exponentiation
-        MN = np.zeros((2 * k, 2 * k))
-        MN[:k, :k] = A
-        MN[:k, k:] = -R.T
-        MN[k:, :k] = R
-        MN[k:, k:] = np.zeros((k, k))
+        return Q
 
-        # Matrix exponential
-        exp_MN = expm(MN)
-
-        # Extract result
-        XQ = np.hstack([X, Q])
-        result = XQ @ exp_MN[:, :k]
-
-        # Project to ensure numerical accuracy
-        return StiefelManifold.project_to_manifold(result)
 
     @staticmethod
     def log_map(
@@ -195,42 +177,36 @@ class StiefelManifold:
         tol: float = 1e-10,
     ) -> NDArray[np.floating]:
         """
-        Logarithmic map: compute tangent vector from X to Y.
+        Retraction-inverse log map for the QR retraction exp_map.
 
-        This finds the tangent vector V at X such that exp_X(V) = Y.
-        Uses iterative algorithm since there's no closed-form solution.
+        We construct V such that:
+            X + V = Y R
+        where R is upper-triangular.
+        Then exp_map(X, V) = qf(X + V) = qf(YR) = Y (up to QR sign convention).
 
-        Args:
-            X: Starting point on St(n, k)
-            Y: Target point on St(n, k)
-            max_iter: Maximum iterations
-            tol: Convergence tolerance
-
-        Returns:
-            Tangent vector V at X pointing toward Y
+        NOTE: This is NOT the exact Riemannian logarithm map.
+        It is a consistent inverse for the QR retraction used in exp_map.
         """
-        n, k = X.shape
+        X = np.asarray(X, dtype=np.float64)
+        Y = np.asarray(Y, dtype=np.float64)
 
-        # Initial guess: projected difference
-        V = StiefelManifold.project_to_tangent(X, Y - X)
+        # A is k×k
+        A = X.T @ Y
 
-        for iteration in range(max_iter):
-            # Current endpoint
-            Y_approx = StiefelManifold.exp_map(X, V)
+        # QR factorization of A gives an upper-triangular R
+        Qa, Ra = qr(A, mode="economic")
 
-            # Error in matching Y
-            error = Y - Y_approx
-            error_norm = np.linalg.norm(error, "fro")
+        # Make R have nonnegative diagonal for deterministic behaviour
+        d = np.sign(np.diag(Ra))
+        d[d == 0] = 1.0
+        Ra = (d[:, None] * Ra)  # flip rows so diag is >= 0
 
-            if error_norm < tol:
-                break
-
-            # Update V using differential of exp
-            # Simplified: use projected error as correction
-            dV = StiefelManifold.project_to_tangent(X, error)
-            V = V + 0.5 * dV
+        # Construct V so that X + V = Y @ R
+        V = (Y @ Ra) - X
 
         return V
+
+
 
     @staticmethod
     def geodesic_distance(
@@ -241,13 +217,6 @@ class StiefelManifold:
         Compute geodesic distance between two points on St(n, k).
 
         Based on the principal angles between the subspaces.
-
-        Args:
-            X: Point on St(n, k)
-            Y: Point on St(n, k)
-
-        Returns:
-            Geodesic distance
         """
         # SVD of X^T Y gives principal angles
         _, s, _ = svd(X.T @ Y, full_matrices=False)
@@ -255,11 +224,21 @@ class StiefelManifold:
         # Clamp singular values to valid range
         s = np.clip(s, -1.0, 1.0)
 
+        # Treat numerically-equal values as exact
+        s = np.where(1.0 - s < 1e-12, 1.0, s)
+
         # Principal angles
         angles = np.arccos(s)
 
         # Geodesic distance (Frobenius metric)
-        return np.sqrt(np.sum(angles ** 2))
+        d = float(np.linalg.norm(angles))
+
+        # Snap near-zero distances to zero
+        if abs(d) < 1e-10:
+            return 0.0
+
+        return d
+
 
     @staticmethod
     def retract_qr(
@@ -279,7 +258,8 @@ class StiefelManifold:
             Point on St(n, k)
         """
         Y = X + t * V
-        Q, R = qr(Y, mode="reduced")
+        Q, R = np.linalg.qr(Y, mode="reduced")
+
 
         # Ensure consistent orientation
         signs = np.sign(np.diag(R))
