@@ -146,11 +146,12 @@ class SpectralEmbedding:
 
         # Compute smallest eigenvalues/eigenvectors
         # We want low-frequency modes (smallest eigenvalues of Laplacian)
+        # Use small positive sigma to avoid singularity issues when L has zero eigenvalue
         eigenvalues, eigenvectors = eigsh(
             L.astype(np.float64),
             k=n_components,
-            which="LM",  # Smallest magnitude
-            sigma=0,  # Shift to help with numerical stability
+            which="LM",  # Largest magnitude after shift-invert
+            sigma=1e-6,  # Small positive shift to avoid singularity
             maxiter=1000,
             tol=1e-8,
         )

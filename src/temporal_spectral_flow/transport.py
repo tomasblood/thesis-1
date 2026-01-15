@@ -9,6 +9,9 @@ transport-consistent supervision targets during training. It resolves:
 
 Key principle: Alignment is performed between spectral representations,
 not raw data points. We align geometric structure, not individual points.
+
+This implementation includes pure NumPy fallbacks for Sinkhorn algorithms,
+enabling use on Python versions where POT is not available.
 """
 
 from dataclasses import dataclass
@@ -16,10 +19,262 @@ from typing import Literal, Optional, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
-import pytest
-pytest.importorskip("ot")
+
+# Try to import POT, but we have fallbacks
+try:
+    import ot
+    HAS_OT = True
+except ImportError:
+    ot = None
+    HAS_OT = False
 
 
+# =============================================================================
+# Pure NumPy Sinkhorn Implementations (no POT dependency)
+# =============================================================================
+
+def sinkhorn_numpy(
+    a: NDArray[np.floating],
+    b: NDArray[np.floating],
+    C: NDArray[np.floating],
+    reg: float,
+    max_iter: int = 1000,
+    tol: float = 1e-9,
+    warn: bool = True,
+) -> Tuple[NDArray[np.floating], dict]:
+    """
+    Sinkhorn-Knopp algorithm for balanced optimal transport (pure NumPy).
+
+    Solves: min_P <C, P> + reg * KL(P | ab^T)
+    subject to: P @ 1 = a, P.T @ 1 = b
+
+    Args:
+        a: Source distribution (n,), must sum to 1
+        b: Target distribution (m,), must sum to 1
+        C: Cost matrix (n, m)
+        reg: Entropic regularization strength
+        max_iter: Maximum iterations
+        tol: Convergence tolerance (on marginal error)
+        warn: Whether to warn on non-convergence
+
+    Returns:
+        P: Transport plan (n, m)
+        info: Convergence information dict
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    C = np.asarray(C, dtype=np.float64)
+
+    n, m = C.shape
+
+    # Gibbs kernel
+    K = np.exp(-C / reg)
+
+    # Initialize scaling vectors
+    u = np.ones(n, dtype=np.float64)
+    v = np.ones(m, dtype=np.float64)
+
+    # Stabilization: work in log domain for numerical stability
+    # But for simplicity, use standard iteration with clamping
+
+    converged = False
+    for iteration in range(max_iter):
+        u_prev = u.copy()
+
+        # Sinkhorn iterations
+        Kv = K @ v
+        u = a / np.maximum(Kv, 1e-300)
+
+        Ktu = K.T @ u
+        v = b / np.maximum(Ktu, 1e-300)
+
+        # Check convergence (marginal error)
+        if iteration % 10 == 0:
+            # Check row marginal
+            P_row_sum = u * (K @ v)
+            err = np.max(np.abs(P_row_sum - a))
+
+            if err < tol:
+                converged = True
+                break
+
+    # Compute transport plan
+    P = np.diag(u) @ K @ np.diag(v)
+
+    info = {
+        "method": "sinkhorn_numpy",
+        "converged": converged,
+        "iterations": iteration + 1,
+    }
+
+    if warn and not converged:
+        import warnings
+        warnings.warn(
+            f"Sinkhorn did not converge after {max_iter} iterations. "
+            f"Consider increasing reg or max_iter."
+        )
+
+    return P, info
+
+
+def sinkhorn_unbalanced_numpy(
+    a: NDArray[np.floating],
+    b: NDArray[np.floating],
+    C: NDArray[np.floating],
+    reg: float,
+    reg_m: float,
+    max_iter: int = 1000,
+    tol: float = 1e-9,
+    warn: bool = True,
+) -> Tuple[NDArray[np.floating], dict]:
+    """
+    Unbalanced Sinkhorn algorithm with KL divergence penalty (pure NumPy).
+
+    Solves: min_P <C, P> + reg * KL(P | ab^T) + reg_m * KL(P1 | a) + reg_m * KL(P^T1 | b)
+
+    The marginal constraints are relaxed via KL penalty with strength reg_m.
+
+    Args:
+        a: Source distribution (n,)
+        b: Target distribution (m,)
+        C: Cost matrix (n, m)
+        reg: Entropic regularization strength
+        reg_m: Marginal relaxation strength (KL penalty on marginals)
+        max_iter: Maximum iterations
+        tol: Convergence tolerance
+        warn: Whether to warn on non-convergence
+
+    Returns:
+        P: Transport plan (n, m)
+        info: Convergence information dict
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    C = np.asarray(C, dtype=np.float64)
+
+    n, m = C.shape
+
+    # Gibbs kernel
+    K = np.exp(-C / reg)
+
+    # Scaling exponent for unbalanced case
+    fi = reg_m / (reg_m + reg)
+
+    # Initialize scaling vectors
+    u = np.ones(n, dtype=np.float64)
+    v = np.ones(m, dtype=np.float64)
+
+    converged = False
+    for iteration in range(max_iter):
+        u_prev = u.copy()
+
+        # Unbalanced Sinkhorn iterations
+        Kv = K @ v
+        u = (a / np.maximum(Kv, 1e-300)) ** fi
+
+        Ktu = K.T @ u
+        v = (b / np.maximum(Ktu, 1e-300)) ** fi
+
+        # Clamp to prevent overflow
+        u = np.clip(u, 1e-300, 1e300)
+        v = np.clip(v, 1e-300, 1e300)
+
+        # Check convergence
+        if iteration % 10 == 0:
+            err = np.max(np.abs(u - u_prev) / np.maximum(np.abs(u), 1e-10))
+            if err < tol:
+                converged = True
+                break
+
+    # Compute transport plan
+    P = np.diag(u) @ K @ np.diag(v)
+
+    info = {
+        "method": "sinkhorn_unbalanced_numpy",
+        "converged": converged,
+        "iterations": iteration + 1,
+        "reg_m": reg_m,
+    }
+
+    if warn and not converged:
+        import warnings
+        warnings.warn(
+            f"Unbalanced Sinkhorn did not converge after {max_iter} iterations."
+        )
+
+    return P, info
+
+
+def partial_transport_numpy(
+    a: NDArray[np.floating],
+    b: NDArray[np.floating],
+    C: NDArray[np.floating],
+    m: float,
+    reg: float = 0.1,
+    max_iter: int = 1000,
+    tol: float = 1e-9,
+    warn: bool = True,
+) -> Tuple[NDArray[np.floating], dict]:
+    """
+    Partial optimal transport via entropic regularization (pure NumPy).
+
+    Transports only a fraction m of the total mass.
+    Uses entropic regularization to approximate the partial OT problem.
+
+    Args:
+        a: Source distribution (n,)
+        b: Target distribution (m_dim,)
+        C: Cost matrix (n, m_dim)
+        m: Amount of mass to transport (0 < m <= min(sum(a), sum(b)))
+        reg: Entropic regularization strength
+        max_iter: Maximum iterations
+        tol: Convergence tolerance
+        warn: Whether to warn on non-convergence
+
+    Returns:
+        P: Transport plan (n, m_dim)
+        info: Convergence information dict
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    C = np.asarray(C, dtype=np.float64)
+
+    n, m_dim = C.shape
+
+    # For partial transport, we add a "dummy" sink/source
+    # But a simpler approach: use unbalanced transport with appropriate reg_m
+    # that encourages transporting approximately m mass
+
+    # Simpler approach: scale marginals and use balanced Sinkhorn
+    total_a = a.sum()
+    total_b = b.sum()
+
+    # Scale to transport m mass
+    scale = m / min(total_a, total_b)
+    a_scaled = a * scale
+    b_scaled = b * scale
+
+    # Normalize to sum to m
+    a_scaled = a_scaled / a_scaled.sum() * m
+    b_scaled = b_scaled / b_scaled.sum() * m
+
+    # Use unbalanced transport with moderate reg_m
+    # This allows marginals to not sum exactly to target
+    P, info = sinkhorn_unbalanced_numpy(
+        a_scaled, b_scaled, C, reg, reg_m=1.0,
+        max_iter=max_iter, tol=tol, warn=warn
+    )
+
+    info["method"] = "partial_transport_numpy"
+    info["transported_mass"] = P.sum()
+    info["target_mass"] = m
+
+    return P, info
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 @dataclass
 class AlignmentResult:
@@ -43,6 +298,10 @@ class AlignmentResult:
     convergence_info: Optional[dict] = None
 
 
+# =============================================================================
+# Main Transport Alignment Class
+# =============================================================================
+
 class TransportAlignment:
     """
     Optimal transport-based alignment for spectral representations.
@@ -56,11 +315,15 @@ class TransportAlignment:
     2. Solve optimal transport problem
     3. Apply transport plan to align target to source frame
 
+    This implementation includes pure NumPy fallbacks, so it works on
+    any Python version (including 3.14) without requiring POT.
+
     Attributes:
         method: Transport method ('balanced', 'unbalanced', 'partial')
         reg: Entropic regularization strength
         reg_m: Marginal relaxation for unbalanced transport
         cost_type: Type of cost function to use
+        use_pot: Whether to use POT library (if available) or pure NumPy
     """
 
     def __init__(
@@ -71,6 +334,7 @@ class TransportAlignment:
         cost_type: Literal["euclidean", "spectral", "geometric"] = "spectral",
         max_iter: int = 1000,
         tol: float = 1e-9,
+        use_pot: Optional[bool] = None,
     ):
         """
         Initialize transport alignment.
@@ -89,6 +353,8 @@ class TransportAlignment:
                 - 'geometric': Distance in local geometry fingerprints
             max_iter: Maximum Sinkhorn iterations
             tol: Convergence tolerance
+            use_pot: If True, use POT library; if False, use NumPy fallback;
+                     if None (default), use POT if available
         """
         self.method = method
         self.reg = reg
@@ -96,6 +362,17 @@ class TransportAlignment:
         self.cost_type = cost_type
         self.max_iter = max_iter
         self.tol = tol
+
+        # Decide whether to use POT
+        if use_pot is None:
+            self.use_pot = HAS_OT
+        else:
+            if use_pot and not HAS_OT:
+                raise ImportError(
+                    "POT library requested but not available. "
+                    "Install with: pip install pot"
+                )
+            self.use_pot = use_pot
 
     def compute_cost_matrix(
         self,
@@ -294,13 +571,20 @@ class TransportAlignment:
         b: NDArray[np.floating],
     ) -> Tuple[NDArray[np.floating], dict]:
         """Solve balanced OT with Sinkhorn algorithm."""
-        P = ot.sinkhorn(
-            a, b, C, self.reg,
-            numItermax=self.max_iter,
-            stopThr=self.tol,
-            log=False,
-        )
-        return P, {"method": "sinkhorn"}
+        if self.use_pot:
+            P = ot.sinkhorn(
+                a, b, C, self.reg,
+                numItermax=self.max_iter,
+                stopThr=self.tol,
+                log=False,
+            )
+            return P, {"method": "sinkhorn_pot"}
+        else:
+            return sinkhorn_numpy(
+                a, b, C, self.reg,
+                max_iter=self.max_iter,
+                tol=self.tol,
+            )
 
     def _solve_unbalanced(
         self,
@@ -309,12 +593,19 @@ class TransportAlignment:
         b: NDArray[np.floating],
     ) -> Tuple[NDArray[np.floating], dict]:
         """Solve unbalanced OT with Sinkhorn-Knopp algorithm."""
-        P = ot.unbalanced.sinkhorn_unbalanced(
-            a, b, C, self.reg, self.reg_m,
-            numItermax=self.max_iter,
-            stopThr=self.tol,
-        )
-        return P, {"method": "sinkhorn_unbalanced", "reg_m": self.reg_m}
+        if self.use_pot:
+            P = ot.unbalanced.sinkhorn_unbalanced(
+                a, b, C, self.reg, self.reg_m,
+                numItermax=self.max_iter,
+                stopThr=self.tol,
+            )
+            return P, {"method": "sinkhorn_unbalanced_pot", "reg_m": self.reg_m}
+        else:
+            return sinkhorn_unbalanced_numpy(
+                a, b, C, self.reg, self.reg_m,
+                max_iter=self.max_iter,
+                tol=self.tol,
+            )
 
     def _solve_partial(
         self,
@@ -327,11 +618,19 @@ class TransportAlignment:
         if m is None:
             m = 0.8 * min(a.sum(), b.sum())
 
-        P = ot.partial.partial_wasserstein(
-            a, b, C, m=m,
-            numItermax=self.max_iter,
-        )
-        return P, {"method": "partial", "transported_mass": m}
+        if self.use_pot:
+            P = ot.partial.partial_wasserstein(
+                a, b, C, m=m,
+                numItermax=self.max_iter,
+            )
+            return P, {"method": "partial_pot", "transported_mass": m}
+        else:
+            return partial_transport_numpy(
+                a, b, C, m,
+                reg=self.reg,
+                max_iter=self.max_iter,
+                tol=self.tol,
+            )
 
     def _apply_transport(
         self,
@@ -390,6 +689,10 @@ class TransportAlignment:
 
         return mass_created, mass_destroyed
 
+
+# =============================================================================
+# Basis Alignment (no OT dependency)
+# =============================================================================
 
 class BasisAligner:
     """
