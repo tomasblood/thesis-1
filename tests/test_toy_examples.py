@@ -9,7 +9,6 @@ Each toy example isolates a specific failure mode of naive approaches and
 demonstrates how the method handles it correctly.
 """
 import pytest
-ot = pytest.importorskip("ot", reason="Toy OT tests require POT (pip install pot).")
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
