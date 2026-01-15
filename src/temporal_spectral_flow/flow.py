@@ -379,8 +379,13 @@ class SpectralFlowModel(nn.Module):
 
         Uses QR retraction for efficiency.
         """
+        # Handle dt broadcasting for batched tensors
         if isinstance(dt, torch.Tensor):
-            dt = dt.item() if dt.numel() == 1 else dt
+            if dt.numel() == 1:
+                dt = dt.item()
+            elif dt.dim() >= 1 and Phi.dim() == 3:
+                # Reshape dt from (batch,) to (batch, 1, 1) for broadcasting
+                dt = dt.view(-1, 1, 1)
 
         Y = Phi + dt * V
 
