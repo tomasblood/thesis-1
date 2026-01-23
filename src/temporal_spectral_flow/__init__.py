@@ -30,6 +30,20 @@ def __getattr__(name):
         from temporal_spectral_flow.tid import TemporalIntrinsicDimension
         return TemporalIntrinsicDimension
 
+    # Core: Spectral alignment (NumPy/SciPy only)
+    elif name == "SpectralMatcher":
+        from temporal_spectral_flow.alignment import SpectralMatcher
+        return SpectralMatcher
+    elif name == "SignConvention":
+        from temporal_spectral_flow.alignment import SignConvention
+        return SignConvention
+    elif name == "SpectralAligner":
+        from temporal_spectral_flow.alignment import SpectralAligner
+        return SpectralAligner
+    elif name == "AlignedSpectralPair":
+        from temporal_spectral_flow.alignment import AlignedSpectralPair
+        return AlignedSpectralPair
+
     # Optional: Requires POT
     elif name == "TransportAlignment":
         try:
@@ -64,16 +78,56 @@ def __getattr__(name):
                 f"Install with: pip install torch\nOriginal error: {e}"
             ) from e
 
+    # Optional: Joint spectral flow (requires PyTorch)
+    elif name == "JointSpectralFlow":
+        try:
+            from temporal_spectral_flow.joint_flow import JointSpectralFlow
+            return JointSpectralFlow
+        except ImportError as e:
+            raise ImportError(
+                f"JointSpectralFlow requires PyTorch. "
+                f"Install with: pip install torch\nOriginal error: {e}"
+            ) from e
+    elif name == "EigenvalueVelocityField":
+        try:
+            from temporal_spectral_flow.joint_flow import EigenvalueVelocityField
+            return EigenvalueVelocityField
+        except ImportError as e:
+            raise ImportError(
+                f"EigenvalueVelocityField requires PyTorch. "
+                f"Install with: pip install torch\nOriginal error: {e}"
+            ) from e
+    elif name == "EigenvectorVelocityField":
+        try:
+            from temporal_spectral_flow.joint_flow import EigenvectorVelocityField
+            return EigenvectorVelocityField
+        except ImportError as e:
+            raise ImportError(
+                f"EigenvectorVelocityField requires PyTorch. "
+                f"Install with: pip install torch\nOriginal error: {e}"
+            ) from e
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
+    # Core
     "GraphConstructor",
     "SpectralEmbedding",
     "StiefelManifold",
+    "TemporalIntrinsicDimension",
+    # Spectral alignment
+    "SpectralMatcher",
+    "SignConvention",
+    "SpectralAligner",
+    "AlignedSpectralPair",
+    # Optimal transport
     "TransportAlignment",
     "BasisAligner",
+    # Flow models (require PyTorch)
     "SpectralFlowModel",
-    "TemporalIntrinsicDimension",
     "FlowTrainer",
+    "JointSpectralFlow",
+    "EigenvalueVelocityField",
+    "EigenvectorVelocityField",
 ]
