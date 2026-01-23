@@ -73,3 +73,7 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Generated test figures (can be regenerated with tests/test_viz.py)
+figures/test_runs/*.png
+figures/test_runs/*.pdf
