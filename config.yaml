@@ -1,0 +1,53 @@
+# Temporal Spectral Flow Configuration
+# Default configuration for training and experiments
+
+# Model configuration
+model:
+  k: 10                          # Spectral dimension (number of eigenvectors)
+  hidden_dims: [256, 256, 256]   # Hidden layer dimensions for velocity field
+  time_embed_dim: 64             # Dimension of time embedding
+  integration_method: euler      # euler, midpoint, or rk4
+
+# Training configuration
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  batch_size: 32
+  n_steps: 10000                 # Total training steps
+  grad_clip: 1.0
+
+  # Loss weights
+  velocity_loss_weight: 1.0
+  endpoint_loss_weight: 0.1
+  regularization_weight: 0.01
+
+  # Integration
+  n_integration_steps: 10
+
+  # Logging
+  log_interval: 100
+  checkpoint_interval: 1000
+
+# Alignment configuration
+alignment:
+  method: unbalanced             # balanced, unbalanced, or partial
+  reg: 0.1                       # Entropic regularization
+  reg_m: 1.0                     # Mass regularization (for unbalanced)
+
+# Spectral embedding configuration
+spectral:
+  n_neighbors: 15                # k-NN for graph construction
+  sigma: auto                    # Kernel bandwidth (auto or float)
+  normalize_laplacian: true      # Use normalized Laplacian
+
+# TID configuration
+tid:
+  method: energy_based           # energy_based or threshold
+  energy_threshold: 0.1          # Energy threshold for stability
+  min_stability: 0.5             # Minimum stability score
+
+# Device configuration
+device: auto                     # auto, cpu, cuda, or cuda:N
+
+# Random seed for reproducibility
+seed: 42
