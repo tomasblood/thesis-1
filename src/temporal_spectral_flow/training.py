@@ -21,6 +21,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from loguru import logger
+from einops import rearrange, einsum
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
 from temporal_spectral_flow.flow import SpectralFlowModel, numpy_to_torch, torch_to_numpy
 from temporal_spectral_flow.spectral import SpectralSnapshot, TemporalSpectralEmbedding
@@ -265,11 +269,12 @@ class FlowTrainer:
         v = self.model.predict_velocity(Phi_t, t)
         return torch.mean(v ** 2)
 
+    @jaxtyped(typechecker=beartype)
     def _project_to_tangent_batch(
         self,
-        Phi: torch.Tensor,
-        V: torch.Tensor,
-    ) -> torch.Tensor:
+        Phi: Float[torch.Tensor, "batch n k"],
+        V: Float[torch.Tensor, "batch n k"],
+    ) -> Float[torch.Tensor, "batch n k"]:
         """
         Project V to tangent space at Phi (batched).
 
@@ -281,9 +286,9 @@ class FlowTrainer:
             Projected tangent vectors
         """
         # V_tan = V - Phi @ sym(Phi^T @ V)
-        PhiTV = torch.bmm(Phi.transpose(-2, -1), V)  # (batch, k, k)
-        sym_PhiTV = (PhiTV + PhiTV.transpose(-2, -1)) / 2
-        return V - torch.bmm(Phi, sym_PhiTV)
+        PhiTV = einsum(Phi, V, 'b n k, b n l -> b k l')  # (batch, k, k)
+        sym_PhiTV = (PhiTV + rearrange(PhiTV, 'b i j -> b j i')) / 2
+        return V - einsum(Phi, sym_PhiTV, 'b n k, b k l -> b n l')
 
     def train_step(
         self,
@@ -304,7 +309,7 @@ class FlowTrainer:
         Phi_t, Phi_next_aligned, t = batch
         Phi_t = Phi_t.to(self.device)
         Phi_next_aligned = Phi_next_aligned.to(self.device)
-        t = t.squeeze(-1).to(self.device)
+        t = rearrange(t, 'b 1 -> b').to(self.device)
 
         # Compute losses
         velocity_loss = self.compute_velocity_loss(Phi_t, Phi_next_aligned, t)
@@ -420,10 +425,12 @@ class FlowTrainer:
             # Validation
             if val_dataloader is not None:
                 val_loss = self.evaluate(val_dataloader)
-                print(f"Epoch {epoch}: train_loss={train_losses['total_loss']:.4f}, "
-                      f"val_loss={val_loss:.4f}")
+                logger.info(
+                    f"Epoch {epoch}: train_loss={train_losses['total_loss']:.4f}, "
+                    f"val_loss={val_loss:.4f}"
+                )
             else:
-                print(f"Epoch {epoch}: train_loss={train_losses['total_loss']:.4f}")
+                logger.info(f"Epoch {epoch}: train_loss={train_losses['total_loss']:.4f}")
 
             # Update best loss
             if train_losses["total_loss"] < self.state.best_loss:
@@ -461,7 +468,7 @@ class FlowTrainer:
                 Phi_t, Phi_next_aligned, t = batch
                 Phi_t = Phi_t.to(self.device)
                 Phi_next_aligned = Phi_next_aligned.to(self.device)
-                t = t.squeeze(-1).to(self.device)
+                t = rearrange(t, 'b 1 -> b').to(self.device)
 
                 velocity_loss = self.compute_velocity_loss(Phi_t, Phi_next_aligned, t)
                 total_loss += velocity_loss.item()

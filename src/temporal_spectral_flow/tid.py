@@ -20,6 +20,7 @@ from typing import Literal, Optional, Tuple
 import numpy as np
 from numpy.typing import NDArray
 import torch
+from einops import rearrange
 
 from temporal_spectral_flow.flow import SpectralFlowModel, numpy_to_torch, torch_to_numpy
 from temporal_spectral_flow.spectral import SpectralSnapshot
@@ -236,8 +237,8 @@ class TemporalIntrinsicDimension:
                 t_tensor = torch.tensor([float(t)], device=device)
 
                 with torch.no_grad():
-                    v = self.model.predict_velocity(Phi.unsqueeze(0), t_tensor)
-                    v = v.squeeze(0)
+                    v = self.model.predict_velocity(rearrange(Phi, 'n k -> 1 n k'), t_tensor)
+                    v = rearrange(v, '1 n k -> n k')
 
                 # Energy in this dimension
                 v_dim = v[:, dim_idx]

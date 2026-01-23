@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "temporal-spectral-flow"
@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Temporal Spectral Flow with Transport-Consistent Alignment for learning dynamical models of geometric structure evolution"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 authors = [
     {name = "Tomas Blood"}
 ]
@@ -25,9 +25,8 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -38,15 +37,25 @@ dependencies = [
     "scikit-learn>=1.0.0",
     "networkx>=2.6.0",
     "tqdm>=4.62.0",
+    "pyyaml>=6.0.0",
+    # CLAUDE.md required stack
+    "einops>=0.7.0",
+    "beartype>=0.18.0",
+    "jaxtyping>=0.2.25",
+    "loguru>=0.7.0",
+    "accelerate>=0.25.0",
+    "fire>=0.5.0",
 ]
 
+[project.scripts]
+tsf = "cli:main"
+
 [project.optional-dependencies]
-ot = ["pot>=0.9.0"]   # only OT stuff
+ot = ["pot>=0.9.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
-    "black>=23.0.0",
-    "isort>=5.12.0",
+    "ruff>=0.1.0",
     "mypy>=1.0.0",
 ]
 viz = [
@@ -58,19 +67,22 @@ viz = [
 "Homepage" = "https://github.com/tomasblood/thesis-1"
 "Bug Tracker" = "https://github.com/tomasblood/thesis-1/issues"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/temporal_spectral_flow"]
 
-[tool.black]
+[tool.ruff]
 line-length = 100
-target-version = ['py39', 'py310', 'py311']
+target-version = "py311"
 
-[tool.isort]
-profile = "black"
-line_length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["temporal_spectral_flow"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

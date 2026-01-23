@@ -18,6 +18,9 @@ from numpy.typing import NDArray
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, einsum
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
 from temporal_spectral_flow.stiefel import StiefelManifold
 
@@ -119,7 +122,7 @@ class StiefelVelocityField(nn.Module):
         """
         # Handle unbatched input
         if Phi.dim() == 2:
-            Phi = Phi.unsqueeze(0)
+            Phi = rearrange(Phi, 'n k -> 1 n k')
             squeeze_output = True
         else:
             squeeze_output = False
@@ -128,7 +131,7 @@ class StiefelVelocityField(nn.Module):
 
         # Ensure t has correct shape
         if t.dim() == 0:
-            t = t.unsqueeze(0).expand(batch_size)
+            t = rearrange(t, '-> 1').expand(batch_size)
         elif t.shape[0] == 1:
             t = t.expand(batch_size)
 
@@ -141,10 +144,10 @@ class StiefelVelocityField(nn.Module):
 
         # Optional attention
         if self.use_attention:
-            features = features.unsqueeze(1)  # (batch, 1, hidden_dim)
+            features = rearrange(features, 'b d -> b 1 d')  # (batch, 1, hidden_dim)
             attn_out, _ = self.attention(features, features, features)
             features = self.attn_norm(features + attn_out)
-            features = features.squeeze(1)  # (batch, hidden_dim)
+            features = rearrange(features, 'b 1 d -> b d')  # (batch, hidden_dim)
 
         # Concatenate with time
         combined = torch.cat([features, t_embed], dim=-1)
@@ -154,11 +157,11 @@ class StiefelVelocityField(nn.Module):
 
         # Predict velocity coefficients
         velocity_coeffs = self.velocity_head(hidden)  # (batch, k*k)
-        velocity_coeffs = velocity_coeffs.view(batch_size, k, k)
+        velocity_coeffs = rearrange(velocity_coeffs, 'b (k1 k2) -> b k1 k2', k1=k, k2=k)
 
         # Project to tangent space
         # V = Phi @ A where A is skew-symmetric
-        A = velocity_coeffs - velocity_coeffs.transpose(-2, -1)  # Skew-symmetric
+        A = velocity_coeffs - rearrange(velocity_coeffs, 'b i j -> b j i')  # Skew-symmetric
         A = A / 2.0
 
         # Also add component orthogonal to Phi
@@ -167,10 +170,10 @@ class StiefelVelocityField(nn.Module):
 
         # Actually, full tangent space parameterization:
         # Generate orthogonal complement contribution
-        V = Phi @ A  # (batch, N, k)
+        V = einsum(Phi, A, 'b n k, b k l -> b n l')  # (batch, N, k)
 
         if squeeze_output:
-            V = V.squeeze(0)
+            V = rearrange(V, '1 n k -> n k')
 
         return V
 
@@ -186,8 +189,8 @@ class StiefelVelocityField(nn.Module):
         """
         batch_size, N, k = Phi.shape
 
-        # Gram matrix (k x k)
-        gram = torch.bmm(Phi.transpose(-2, -1), Phi)  # (batch, k, k)
+        # Gram matrix (k x k) using einsum: Phi^T @ Phi
+        gram = einsum(Phi, Phi, 'b n k, b n l -> b k l')  # (batch, k, k)
 
         # Extract upper triangle (including diagonal)
         indices = torch.triu_indices(k, k)
@@ -225,7 +228,8 @@ class SinusoidalTimeEmbedding(nn.Module):
             torch.arange(half_dim, device=t.device, dtype=t.dtype) / half_dim
         )
 
-        args = t.unsqueeze(-1) * freqs.unsqueeze(0)
+        # t: (batch,) -> (batch, 1), freqs: (half_dim,) -> (1, half_dim)
+        args = rearrange(t, 'b -> b 1') * rearrange(freqs, 'd -> 1 d')
         embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
         if self.dim % 2:
@@ -385,7 +389,7 @@ class SpectralFlowModel(nn.Module):
                 dt = dt.item()
             elif dt.dim() >= 1 and Phi.dim() == 3:
                 # Reshape dt from (batch,) to (batch, 1, 1) for broadcasting
-                dt = dt.view(-1, 1, 1)
+                dt = rearrange(dt, 'b -> b 1 1')
 
         Y = Phi + dt * V
 
@@ -395,14 +399,14 @@ class SpectralFlowModel(nn.Module):
             # Ensure consistent sign
             signs = torch.sign(torch.diag(R))
             signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-            Q = Q * signs.unsqueeze(0)
+            Q = Q * rearrange(signs, 'k -> 1 k')
         else:
             # Batched QR
             Q, R = torch.linalg.qr(Y)
             diag_R = torch.diagonal(R, dim1=-2, dim2=-1)
             signs = torch.sign(diag_R)
             signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-            Q = Q * signs.unsqueeze(-2)
+            Q = Q * rearrange(signs, 'b k -> b 1 k')
 
         return Q
 
@@ -456,10 +460,11 @@ class SpectralFlowModel(nn.Module):
         return trajectory
 
 
+@jaxtyped(typechecker=beartype)
 def numpy_to_torch(
     arr: NDArray[np.floating],
     device: Optional[torch.device] = None,
-) -> torch.Tensor:
+) -> Float[torch.Tensor, "..."]:
     """Convert numpy array to torch tensor."""
     tensor = torch.from_numpy(arr.astype(np.float32))
     if device is not None:
@@ -467,6 +472,7 @@ def numpy_to_torch(
     return tensor
 
 
-def torch_to_numpy(tensor: torch.Tensor) -> NDArray[np.floating]:
+@jaxtyped(typechecker=beartype)
+def torch_to_numpy(tensor: Float[torch.Tensor, "..."]) -> NDArray[np.floating]:
     """Convert torch tensor to numpy array."""
     return tensor.detach().cpu().numpy()

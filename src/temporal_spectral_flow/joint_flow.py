@@ -14,6 +14,9 @@ from numpy.typing import NDArray
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, einsum
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
 from temporal_spectral_flow.stiefel import StiefelManifold
 from temporal_spectral_flow.flow import SinusoidalTimeEmbedding
@@ -77,7 +80,7 @@ class EigenvalueVelocityField(nn.Module):
             Velocity in R^k
         """
         if lambda_.dim() == 1:
-            lambda_ = lambda_.unsqueeze(0)
+            lambda_ = rearrange(lambda_, 'k -> 1 k')
             squeeze = True
         else:
             squeeze = False
@@ -85,7 +88,7 @@ class EigenvalueVelocityField(nn.Module):
         batch_size = lambda_.shape[0]
 
         if t.dim() == 0:
-            t = t.unsqueeze(0).expand(batch_size)
+            t = rearrange(t, '-> 1').expand(batch_size)
 
         t_embed = self.time_embed(t)
 
@@ -93,7 +96,7 @@ class EigenvalueVelocityField(nn.Module):
         v = self.net(x)
 
         if squeeze:
-            v = v.squeeze(0)
+            v = rearrange(v, '1 k -> k')
 
         return v
 
@@ -175,8 +178,8 @@ class EigenvectorVelocityField(nn.Module):
             Tangent vector same shape as Phi
         """
         if Phi.dim() == 2:
-            Phi = Phi.unsqueeze(0)
-            lambda_ = lambda_.unsqueeze(0)
+            Phi = rearrange(Phi, 'n k -> 1 n k')
+            lambda_ = rearrange(lambda_, 'k -> 1 k')
             squeeze = True
         else:
             squeeze = False
@@ -184,7 +187,7 @@ class EigenvectorVelocityField(nn.Module):
         batch_size, N, k = Phi.shape
 
         if t.dim() == 0:
-            t = t.unsqueeze(0).expand(batch_size)
+            t = rearrange(t, '-> 1').expand(batch_size)
 
         # Embeddings
         t_embed = self.time_embed(t)  # (batch, time_embed_dim)
@@ -202,14 +205,14 @@ class EigenvectorVelocityField(nn.Module):
 
         # Output k x k coefficients
         coeffs = self.output_head(hidden)  # (batch, k*k)
-        coeffs = coeffs.view(batch_size, k, k)
+        coeffs = rearrange(coeffs, 'b (k1 k2) -> b k1 k2', k1=k, k2=k)
 
         # Construct tangent vector: V = Phi @ A where A is skew-symmetric
-        A = (coeffs - coeffs.transpose(-2, -1)) / 2
-        V = torch.bmm(Phi, A)  # (batch, N, k)
+        A = (coeffs - rearrange(coeffs, 'b i j -> b j i')) / 2
+        V = einsum(Phi, A, 'b n k, b k l -> b n l')  # (batch, N, k)
 
         if squeeze:
-            V = V.squeeze(0)
+            V = rearrange(V, '1 n k -> n k')
 
         return V
 
@@ -406,13 +409,13 @@ class JointSpectralFlow(nn.Module):
             Q, R = torch.linalg.qr(Y)
             signs = torch.sign(torch.diag(R))
             signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-            Q = Q * signs.unsqueeze(0)
+            Q = Q * rearrange(signs, 'k -> 1 k')
         else:
             Q, R = torch.linalg.qr(Y)
             diag_R = torch.diagonal(R, dim1=-2, dim2=-1)
             signs = torch.sign(diag_R)
             signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-            Q = Q * signs.unsqueeze(-2)
+            Q = Q * rearrange(signs, 'b k -> b 1 k')
 
         return Q
 
@@ -446,11 +449,13 @@ def compute_flow_matching_loss(
 
     # Interpolate to time t
     # Linear interpolation for eigenvalues
-    lambda_t = (1 - t.unsqueeze(-1)) * lambda_source + t.unsqueeze(-1) * lambda_target
+    t_expanded = rearrange(t, 'b -> b 1')
+    lambda_t = (1 - t_expanded) * lambda_source + t_expanded * lambda_target
 
     # For eigenvectors, we should use geodesic interpolation
     # Approximate with linear + retraction for simplicity
-    Phi_t_linear = (1 - t.view(-1, 1, 1)) * Phi_source + t.view(-1, 1, 1) * Phi_target
+    t_expanded_phi = rearrange(t, 'b -> b 1 1')
+    Phi_t_linear = (1 - t_expanded_phi) * Phi_source + t_expanded_phi * Phi_target
 
     # Retract to Stiefel
     Phi_t = []
@@ -458,7 +463,7 @@ def compute_flow_matching_loss(
         Q, R = torch.linalg.qr(Phi_t_linear[i])
         signs = torch.sign(torch.diag(R))
         signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        Phi_t.append(Q * signs.unsqueeze(0))
+        Phi_t.append(Q * rearrange(signs, 'k -> 1 k'))
     Phi_t = torch.stack(Phi_t)
 
     # Predict velocity at interpolated point
@@ -488,11 +493,12 @@ def compute_flow_matching_loss(
     return loss, metrics
 
 
+@jaxtyped(typechecker=beartype)
 def _project_to_tangent_batch(
-    Phi: torch.Tensor,
-    V: torch.Tensor,
-) -> torch.Tensor:
+    Phi: Float[torch.Tensor, "batch n k"],
+    V: Float[torch.Tensor, "batch n k"],
+) -> Float[torch.Tensor, "batch n k"]:
     """Project V to tangent space at Phi (batched)."""
-    PhiTV = torch.bmm(Phi.transpose(-2, -1), V)
-    sym_PhiTV = (PhiTV + PhiTV.transpose(-2, -1)) / 2
-    return V - torch.bmm(Phi, sym_PhiTV)
+    PhiTV = einsum(Phi, V, 'b n k, b n l -> b k l')
+    sym_PhiTV = (PhiTV + rearrange(PhiTV, 'b i j -> b j i')) / 2
+    return V - einsum(Phi, sym_PhiTV, 'b n k, b k l -> b n l')
