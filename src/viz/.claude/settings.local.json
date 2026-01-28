@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pytest:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(uv run:*)",
+      "Bash(start \"https://github.com/tomasblood/thesis-1/compare/main...feature/grassmann-flow?expand=1\")",
+      "Bash(cmd //c start \"https://github.com/tomasblood/thesis-1/compare/main...feature/grassmann-flow?expand=1\")"
+    ]
+  }
+}
