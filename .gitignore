@@ -77,3 +77,6 @@ dmypy.json
 # Generated test figures (can be regenerated with tests/test_viz.py)
 figures/test_runs/*.png
 figures/test_runs/*.pdf
+
+# Git worktrees
+.worktrees/
