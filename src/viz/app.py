@@ -1,30 +1,25 @@
 """
-Streamlit interactive dashboard for Flow Matching visualization.
+Streamlit interactive dashboard for Temporal Geodesic Flow Matching.
 
-Mimics the "Play" functionality of Diffusion Explorer while running
-your actual PyTorch research code.
-
-Features:
-    - Time slider to scrub through flow evolution
-    - Scatter plot of particles at time t
-    - Toggle vector field overlay
-    - Play/Pause animation button
-    - Side-by-side method comparison
+Visualizes the spectral flow model training and inference:
+- Training on consecutive spectral pairs (Phi_t, lambda_t) -> (Phi_{t+1}, lambda_{t+1})
+- One-step integration showing predicted vs true evolution
+- Grassmann loss (subspace distance), eigenvalue loss, energy regularization
+- NO sampling from noise - we learn the actual temporal dynamics
 
 Usage:
     cd src && streamlit run viz/app.py
-
-    Or with custom model:
-    streamlit run viz/app.py -- --model_path path/to/checkpoint.pt
 """
 
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+from numpy.typing import NDArray
 
-# Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 try:
@@ -36,296 +31,414 @@ except ImportError:
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
+from matplotlib.patches import FancyArrowPatch
+from mpl_toolkits.mplot3d import proj3d
 
 from viz.styles import ColorPalette, VizStyle, get_time_colors
-from viz.static import integrate_ode, sample_from_gaussian_mixture
+from viz.generators import generate_merging_clusters, generate_evolving_graph
+
+# Import temporal spectral flow machinery
+from temporal_spectral_flow.stiefel import StiefelManifold
+from temporal_spectral_flow.alignment import SpectralAligner, SpectralMatcher, SignConvention
 
 
-# =============================================================================
-# Session State Initialization
-# =============================================================================
+@dataclass
+class FlowPrediction:
+    """Prediction from one-step flow integration."""
+    Phi_pred: NDArray[np.floating]  # Predicted eigenvectors
+    lambda_pred: NDArray[np.floating]  # Predicted eigenvalues
+    velocity_Phi: NDArray[np.floating]  # Velocity on Stiefel
+    velocity_lambda: NDArray[np.floating]  # Velocity for eigenvalues
+
+
+@dataclass
+class FlowLosses:
+    """Losses for temporal geodesic flow matching."""
+    grassmann_loss: float  # Subspace distance
+    eigenvalue_loss: float  # |lambda_pred - lambda_true|
+    energy_regularization: float  # ||velocity||^2
+    total_loss: float
+
+
+def compute_grassmann_distance(
+    Phi1: NDArray[np.floating],
+    Phi2: NDArray[np.floating],
+) -> float:
+    """
+    Compute Grassmann distance between subspaces.
+
+    The Grassmann manifold Gr(n, k) is the space of k-dimensional subspaces
+    in R^n. Distance is based on principal angles between subspaces.
+    """
+    # SVD of Phi1^T @ Phi2 gives cos of principal angles
+    _, s, _ = np.linalg.svd(Phi1.T @ Phi2, full_matrices=False)
+    s = np.clip(s, -1.0, 1.0)
+
+    # Principal angles
+    angles = np.arccos(s)
+
+    # Grassmann distance (chordal metric)
+    return float(np.linalg.norm(np.sin(angles)))
+
+
+def compute_stiefel_distance(
+    Phi1: NDArray[np.floating],
+    Phi2: NDArray[np.floating],
+) -> float:
+    """Compute geodesic distance on Stiefel manifold."""
+    return StiefelManifold.geodesic_distance(Phi1, Phi2)
+
+
+def simulate_flow_prediction(
+    Phi_t: NDArray[np.floating],
+    lambda_t: NDArray[np.floating],
+    Phi_tp1_true: NDArray[np.floating],
+    lambda_tp1_true: NDArray[np.floating],
+    noise_level: float = 0.1,
+    trained_epochs: int = 0,
+) -> FlowPrediction:
+    """
+    Simulate a flow model prediction.
+
+    As training progresses (trained_epochs increases), the prediction
+    improves toward the true target.
+    """
+    # Compute true velocity (target)
+    velocity_Phi_true = Phi_tp1_true - Phi_t
+    velocity_lambda_true = lambda_tp1_true - lambda_t
+
+    # Simulate model prediction quality based on training progress
+    # Early training: mostly noise, later: converges to true
+    quality = min(1.0, trained_epochs / 100.0)  # saturates at 100 epochs
+
+    rng = np.random.default_rng(42 + trained_epochs)
+
+    # Predicted velocity = quality * true_velocity + (1-quality) * noise
+    noise_Phi = rng.standard_normal(Phi_t.shape) * noise_level
+    noise_lambda = rng.standard_normal(lambda_t.shape) * noise_level
+
+    velocity_Phi = quality * velocity_Phi_true + (1 - quality) * noise_Phi
+    velocity_lambda = quality * velocity_lambda_true + (1 - quality) * noise_lambda
+
+    # Project velocity to tangent space of Stiefel
+    velocity_Phi = StiefelManifold.project_to_tangent(Phi_t, velocity_Phi)
+
+    # Integrate one step using QR retraction
+    Phi_pred = StiefelManifold.retract_qr(Phi_t, velocity_Phi, t=1.0)
+    lambda_pred = lambda_t + velocity_lambda
+
+    return FlowPrediction(
+        Phi_pred=Phi_pred,
+        lambda_pred=lambda_pred,
+        velocity_Phi=velocity_Phi,
+        velocity_lambda=velocity_lambda,
+    )
+
+
+def compute_losses(
+    prediction: FlowPrediction,
+    Phi_tp1_true: NDArray[np.floating],
+    lambda_tp1_true: NDArray[np.floating],
+    grassmann_weight: float = 1.0,
+    eigenvalue_weight: float = 1.0,
+    energy_weight: float = 0.01,
+) -> FlowLosses:
+    """
+    Compute all losses for temporal geodesic flow matching.
+
+    Losses:
+    1. Grassmann loss: Distance between predicted and true subspaces
+    2. Eigenvalue loss: MSE between predicted and true eigenvalues
+    3. Energy regularization: Penalize large velocities
+    """
+    # Grassmann loss (subspace distance)
+    grassmann_loss = compute_grassmann_distance(
+        prediction.Phi_pred, Phi_tp1_true
+    )
+
+    # Eigenvalue loss
+    eigenvalue_loss = float(np.mean((prediction.lambda_pred - lambda_tp1_true) ** 2))
+
+    # Energy regularization
+    energy_Phi = float(np.sum(prediction.velocity_Phi ** 2))
+    energy_lambda = float(np.sum(prediction.velocity_lambda ** 2))
+    energy_regularization = energy_Phi + energy_lambda
+
+    # Total loss
+    total_loss = (
+        grassmann_weight * grassmann_loss +
+        eigenvalue_weight * eigenvalue_loss +
+        energy_weight * energy_regularization
+    )
+
+    return FlowLosses(
+        grassmann_loss=grassmann_loss,
+        eigenvalue_loss=eigenvalue_loss,
+        energy_regularization=energy_regularization,
+        total_loss=total_loss,
+    )
 
 
 def init_session_state() -> None:
     """Initialize Streamlit session state variables."""
-    if "time" not in st.session_state:
-        st.session_state.time = 0.0
-    if "playing" not in st.session_state:
-        st.session_state.playing = False
-    if "x0" not in st.session_state:
-        st.session_state.x0 = None
-    if "trajectory" not in st.session_state:
-        st.session_state.trajectory = None
-    if "velocity_mode" not in st.session_state:
-        st.session_state.velocity_mode = "gaussian_to_gaussian"
+    defaults = {
+        "time_idx": 0,
+        "playing": False,
+        "data": None,
+        "params_hash": None,
+        "trained_epochs": 0,
+        "loss_history": [],
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
-# =============================================================================
-# Velocity Field Definitions
-# =============================================================================
-
-
-def create_velocity_field(mode: str):
-    """Create velocity field based on selected mode."""
-    if mode == "gaussian_to_gaussian":
-        # Simple translation flow
-        source_center = np.array([-1.5, 0.0])
-        target_center = np.array([1.5, 0.0])
-
-        def velocity(x: np.ndarray, t: float) -> np.ndarray:
-            # Constant velocity field: v = target - source
-            direction = target_center - source_center
-            return np.tile(direction, (len(x), 1))
-
-        return velocity, source_center, target_center
-
-    elif mode == "rotation":
-        # Rotating flow (non-straight paths)
-        def velocity(x: np.ndarray, t: float) -> np.ndarray:
-            omega = np.pi  # Half rotation
-            vx = -omega * x[:, 1]
-            vy = omega * x[:, 0]
-            return np.stack([vx, vy], axis=1)
-
-        return velocity, np.array([1.0, 0.0]), np.array([-1.0, 0.0])
-
-    elif mode == "two_moons":
-        # Two crescent shapes
-        source_center = np.array([-0.5, 0.5])
-        target_center = np.array([0.5, -0.5])
-
-        def velocity(x: np.ndarray, t: float) -> np.ndarray:
-            # Flow toward target with some curvature
-            direction = target_center - x
-            # Add rotation component for curved paths
-            rotation = np.stack([-direction[:, 1], direction[:, 0]], axis=1) * 0.3
-            return direction + rotation * (1 - t)
-
-        return velocity, source_center, target_center
-
-    elif mode == "swiss_roll_unroll":
-        # Unrolling spiral motion
-        def velocity(x: np.ndarray, t: float) -> np.ndarray:
-            r = np.linalg.norm(x, axis=1, keepdims=True)
-            r = np.maximum(r, 0.1)
-            # Outward spiral
-            radial = x / r * 0.5
-            tangent = np.stack([x[:, 1], -x[:, 0]], axis=1) / r * 0.3
-            return radial + tangent
-
-        return velocity, np.array([0.0, 0.0]), np.array([2.0, 0.0])
-
-    else:
-        raise ValueError(f"Unknown velocity mode: {mode}")
-
-
-def generate_source_samples(mode: str, n_samples: int = 200, seed: int = 42) -> np.ndarray:
-    """Generate source distribution samples based on mode."""
-    rng = np.random.default_rng(seed)
-
-    if mode == "gaussian_to_gaussian":
-        center = np.array([[-1.5, 0.0]])
-        return sample_from_gaussian_mixture(n_samples, center, stds=0.4, seed=seed)
-
-    elif mode == "rotation":
-        # Ring distribution
-        theta = rng.uniform(0, 2 * np.pi, n_samples)
-        r = 1.5 + 0.2 * rng.standard_normal(n_samples)
-        return np.stack([r * np.cos(theta), r * np.sin(theta)], axis=1)
-
-    elif mode == "two_moons":
-        # Upper crescent
-        theta = rng.uniform(0, np.pi, n_samples)
-        x = np.cos(theta) - 0.5
-        y = np.sin(theta) + 0.5
-        noise = 0.1 * rng.standard_normal((n_samples, 2))
-        return np.stack([x, y], axis=1) + noise
-
-    elif mode == "swiss_roll_unroll":
-        # Tight spiral
-        t = 1.5 * np.pi + 2 * np.pi * rng.uniform(0, 1, n_samples)
-        r = 0.3 * t / (2 * np.pi)
-        noise = 0.05 * rng.standard_normal((n_samples, 2))
-        return np.stack([r * np.cos(t), r * np.sin(t)], axis=1) + noise
-
-    else:
-        return sample_from_gaussian_mixture(
-            n_samples,
-            np.array([[0.0, 0.0]]),
-            stds=1.0,
-            seed=seed,
+def generate_spectral_sequence(
+    dataset: str,
+    n_timesteps: int,
+    **kwargs,
+) -> tuple[list, NDArray, dict]:
+    """Generate a temporal spectral sequence based on dataset type."""
+    if dataset == "merging_clusters":
+        frames, labels = generate_merging_clusters(
+            n_points_per_cluster=kwargs.get("n_points", 50),
+            cluster_std=kwargs.get("cluster_std", 0.3),
+            separation_start=kwargs.get("separation_start", 3.0),
+            separation_end=0.0,
+            k_neighbors=kwargs.get("k_neighbors", 10),
+            n_eigenvectors=kwargs.get("n_eigenvectors", 6),
+            n_timesteps=n_timesteps,
         )
+        info = {"type": "merging_clusters"}
+    else:
+        frames, labels = generate_evolving_graph(
+            n_nodes_per_ring=kwargs.get("n_nodes", 20),
+            coupling_start=kwargs.get("coupling_start", 0.0),
+            coupling_end=kwargs.get("coupling_end", 1.0),
+            n_eigenvectors=kwargs.get("n_eigenvectors", 6),
+            n_timesteps=n_timesteps,
+        )
+        info = {"type": "evolving_graph"}
 
-
-# =============================================================================
-# Plotting Functions
-# =============================================================================
-
-
-def plot_particles_at_time(
-    trajectory: list[np.ndarray],
-    t: float,
-    n_steps: int,
-    palette: ColorPalette,
-    show_trails: bool = True,
-    trail_length: int = 10,
-) -> plt.Figure:
-    """Plot particles at a specific time with optional trails."""
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    # Get current frame index
-    idx = int(t * n_steps)
-    idx = min(idx, len(trajectory) - 1)
-    x_t = trajectory[idx]
-    x_0 = trajectory[0]
-    x_1 = trajectory[-1]
-
-    # Draw trails if enabled
-    if show_trails and idx > 0:
-        colors = get_time_colors(idx + 1)
-        trail_start = max(0, idx - trail_length)
-
-        for i in range(len(x_0)):
-            points = np.array([traj[i] for traj in trajectory[trail_start:idx + 1]])
-            if len(points) > 1:
-                segments = np.array([
-                    [points[j], points[j + 1]]
-                    for j in range(len(points) - 1)
-                ])
-                lc = LineCollection(
-                    segments,
-                    colors=colors[trail_start:idx],
-                    linewidths=1.5,
-                    alpha=0.4,
-                )
-                ax.add_collection(lc)
-
-    # Get time-based color
-    time_color = get_time_colors(2)[0] if t < 0.5 else get_time_colors(2)[1]
-
-    # Draw current particles
-    ax.scatter(
-        x_t[:, 0], x_t[:, 1],
-        c=[time_color],
-        s=50,
-        alpha=0.8,
-        edgecolors="white",
-        linewidths=0.5,
-        zorder=10,
-        label=f"Particles at $t={t:.2f}$",
+    # Align the sequence
+    aligner = SpectralAligner(
+        matcher=SpectralMatcher(cost_type="absolute"),
+        sign_convention=SignConvention(method="max_entry"),
     )
 
-    # Draw ghost of source (faded)
-    if t > 0.1:
-        ax.scatter(
-            x_0[:, 0], x_0[:, 1],
-            c=palette.source,
-            s=30,
-            alpha=0.2,
-            marker="o",
-            zorder=1,
+    Phi_sequence = [f.Phi for f in frames]
+    lambda_sequence = [f.eigenvalues for f in frames]
+
+    aligned_pairs = aligner.align_sequence(Phi_sequence, lambda_sequence)
+
+    # Build aligned sequences
+    Phi_aligned = [Phi_sequence[0]]
+    lambda_aligned = [lambda_sequence[0]]
+
+    for pair in aligned_pairs:
+        Phi_aligned.append(pair.Phi_target_aligned)
+        lambda_aligned.append(pair.lambda_target_aligned)
+
+    return frames, labels, {
+        "Phi_aligned": Phi_aligned,
+        "lambda_aligned": lambda_aligned,
+        "aligned_pairs": aligned_pairs,
+        **info,
+    }
+
+
+def plot_flow_step(
+    Phi_t: NDArray[np.floating],
+    Phi_tp1_true: NDArray[np.floating],
+    Phi_tp1_pred: NDArray[np.floating],
+    labels: Optional[NDArray] = None,
+    palette: Optional[ColorPalette] = None,
+    title: str = "One-Step Flow Integration",
+) -> plt.Figure:
+    """
+    Plot the one-step flow integration showing:
+    - Current state (Phi_t)
+    - True next state (Phi_{t+1})
+    - Predicted next state (Phi_pred)
+    """
+    if palette is None:
+        palette = ColorPalette()
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    # Use first two eigenvectors for 2D visualization
+    def scatter_embedding(ax, Phi, title_text, color_idx=0):
+        if labels is not None:
+            colors = [palette.source if l == 0 else palette.target for l in labels]
+        else:
+            colors = get_time_colors(len(Phi))[color_idx] if isinstance(color_idx, int) else color_idx
+
+        ax.scatter(Phi[:, 0], Phi[:, 1], c=colors, s=30, alpha=0.7, edgecolors='white', linewidths=0.5)
+        ax.set_xlabel(r"$\phi_1$", fontsize=10)
+        ax.set_ylabel(r"$\phi_2$", fontsize=10)
+        ax.set_title(title_text, fontsize=11)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    scatter_embedding(axes[0], Phi_t, r"$\Phi_t$ (Current)")
+    scatter_embedding(axes[1], Phi_tp1_true, r"$\Phi_{t+1}$ (True)")
+    scatter_embedding(axes[2], Phi_tp1_pred, r"$\hat{\Phi}_{t+1}$ (Predicted)")
+
+    # Compute and show distances
+    grassmann_dist = compute_grassmann_distance(Phi_tp1_pred, Phi_tp1_true)
+    axes[2].text(
+        0.02, 0.98, f"Grassmann dist: {grassmann_dist:.4f}",
+        transform=axes[2].transAxes, fontsize=9,
+        verticalalignment='top', fontfamily='monospace',
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+    )
+
+    fig.suptitle(title, fontsize=12, fontweight='bold')
+    fig.tight_layout()
+    return fig
+
+
+def plot_eigenvalue_evolution(
+    lambda_sequence: list[NDArray[np.floating]],
+    lambda_pred: Optional[NDArray[np.floating]] = None,
+    current_idx: int = 0,
+    style: Optional[VizStyle] = None,
+) -> plt.Figure:
+    """Plot eigenvalue trajectories with optional predicted values."""
+    if style is None:
+        style = VizStyle(mode="screen")
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    n_timesteps = len(lambda_sequence)
+    n_eigenvalues = lambda_sequence[0].shape[0]
+
+    # Stack into array for plotting
+    lambda_array = np.array(lambda_sequence)
+
+    # Plot each eigenvalue trajectory
+    colors = plt.cm.viridis(np.linspace(0.2, 0.8, n_eigenvalues))
+    for i in range(n_eigenvalues):
+        ax.plot(
+            range(n_timesteps), lambda_array[:, i],
+            color=colors[i], linewidth=1.5, alpha=0.7,
+            label=rf"$\lambda_{{{i+1}}}$",
         )
 
-    # Draw ghost of target (faded)
-    if t < 0.9:
-        ax.scatter(
-            x_1[:, 0], x_1[:, 1],
-            c=palette.target,
-            s=30,
-            alpha=0.2,
-            marker="o",
-            zorder=1,
-        )
+    # Mark current timestep
+    ax.axvline(current_idx, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Current $t$')
 
-    ax.set_xlim(-3.5, 3.5)
-    ax.set_ylim(-3.5, 3.5)
-    ax.set_aspect("equal")
-    ax.set_xlabel("$x_1$", fontsize=12)
-    ax.set_ylabel("$x_2$", fontsize=12)
-    ax.set_title(f"Flow at $t = {t:.2f}$", fontsize=14)
-    ax.legend(loc="upper right")
+    # Plot predicted eigenvalues if available
+    if lambda_pred is not None and current_idx < n_timesteps - 1:
+        for i in range(n_eigenvalues):
+            ax.scatter(
+                [current_idx + 1], [lambda_pred[i]],
+                color=colors[i], s=100, marker='x', linewidths=2,
+                zorder=10,
+            )
+        ax.scatter([], [], color='gray', s=100, marker='x', linewidths=2, label=r"$\hat{\lambda}$ (pred)")
 
-    # Style
+    ax.set_xlabel("Time step", fontsize=11)
+    ax.set_ylabel(r"Eigenvalue $\lambda$", fontsize=11)
+    ax.set_title("Eigenvalue Evolution", fontsize=12, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
     return fig
 
 
-def plot_vector_field_overlay(
-    velocity_fn,
-    t: float,
-    trajectory: list[np.ndarray],
-    n_steps: int,
-    palette: ColorPalette,
-    grid_size: int = 15,
+def plot_velocity_field(
+    Phi: NDArray[np.floating],
+    velocity: NDArray[np.floating],
+    labels: Optional[NDArray] = None,
+    palette: Optional[ColorPalette] = None,
+    scale: float = 1.0,
 ) -> plt.Figure:
-    """Plot particles with vector field overlay."""
-    fig, ax = plt.subplots(figsize=(8, 8))
+    """Plot the velocity field (tangent vectors) at current state."""
+    if palette is None:
+        palette = ColorPalette()
 
-    # Get current particles
-    idx = int(t * n_steps)
-    idx = min(idx, len(trajectory) - 1)
-    x_t = trajectory[idx]
+    fig, ax = plt.subplots(figsize=(6, 6))
 
-    # Create vector field grid
-    x = np.linspace(-3, 3, grid_size)
-    y = np.linspace(-3, 3, grid_size)
-    X, Y = np.meshgrid(x, y)
-    grid_points = np.stack([X.ravel(), Y.ravel()], axis=1)
+    # Scatter current positions
+    if labels is not None:
+        colors = [palette.source if l == 0 else palette.target for l in labels]
+    else:
+        colors = palette.primary
 
-    # Compute velocities
-    velocities = velocity_fn(grid_points, t)
-    U = velocities[:, 0].reshape(X.shape)
-    V = velocities[:, 1].reshape(X.shape)
-    magnitude = np.sqrt(U**2 + V**2)
+    ax.scatter(Phi[:, 0], Phi[:, 1], c=colors, s=40, alpha=0.6, edgecolors='white', linewidths=0.5)
 
-    # Normalize for display
-    max_mag = magnitude.max() if magnitude.max() > 0 else 1
-    U_norm = U / max_mag
-    V_norm = V / max_mag
-
-    # Draw vector field
+    # Draw velocity arrows
     ax.quiver(
-        X, Y, U_norm, V_norm, magnitude,
-        cmap="viridis",
-        alpha=0.6,
-        scale=25,
-        width=0.004,
+        Phi[:, 0], Phi[:, 1],
+        velocity[:, 0] * scale, velocity[:, 1] * scale,
+        angles='xy', scale_units='xy', scale=1,
+        color='red', alpha=0.5, width=0.005,
     )
 
-    # Draw particles
-    time_color = get_time_colors(2)[0] if t < 0.5 else get_time_colors(2)[1]
-    ax.scatter(
-        x_t[:, 0], x_t[:, 1],
-        c=[time_color],
-        s=60,
-        alpha=0.9,
-        edgecolors="white",
-        linewidths=1,
-        zorder=10,
-    )
-
-    ax.set_xlim(-3.5, 3.5)
-    ax.set_ylim(-3.5, 3.5)
+    ax.set_xlabel(r"$\phi_1$", fontsize=11)
+    ax.set_ylabel(r"$\phi_2$", fontsize=11)
+    ax.set_title(r"Velocity Field $\dot{\Phi}$", fontsize=12, fontweight='bold')
     ax.set_aspect("equal")
-    ax.set_xlabel("$x_1$", fontsize=12)
-    ax.set_ylabel("$x_2$", fontsize=12)
-    ax.set_title(f"Vector Field at $t = {t:.2f}$", fontsize=14)
-
+    ax.grid(True, alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
     return fig
 
 
-# =============================================================================
-# Main Streamlit App
-# =============================================================================
+def plot_loss_curves(loss_history: list[FlowLosses]) -> plt.Figure:
+    """Plot training loss curves."""
+    if len(loss_history) < 2:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(0.5, 0.5, "Train to see loss curves", ha='center', va='center', fontsize=12)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        return fig
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 6))
+
+    epochs = range(len(loss_history))
+
+    # Total loss
+    axes[0, 0].plot(epochs, [l.total_loss for l in loss_history], 'b-', linewidth=1.5)
+    axes[0, 0].set_title("Total Loss", fontsize=10)
+    axes[0, 0].set_xlabel("Epoch")
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Grassmann loss
+    axes[0, 1].plot(epochs, [l.grassmann_loss for l in loss_history], 'g-', linewidth=1.5)
+    axes[0, 1].set_title("Grassmann Loss (Subspace)", fontsize=10)
+    axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Eigenvalue loss
+    axes[1, 0].plot(epochs, [l.eigenvalue_loss for l in loss_history], 'r-', linewidth=1.5)
+    axes[1, 0].set_title("Eigenvalue Loss", fontsize=10)
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Energy regularization
+    axes[1, 1].plot(epochs, [l.energy_regularization for l in loss_history], 'm-', linewidth=1.5)
+    axes[1, 1].set_title("Energy Regularization", fontsize=10)
+    axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    for ax in axes.flat:
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.suptitle("Training Losses", fontsize=12, fontweight='bold')
+    fig.tight_layout()
+    return fig
 
 
 def main():
@@ -335,181 +448,296 @@ def main():
         return
 
     st.set_page_config(
-        page_title="Flow Matching Explorer",
-        page_icon="🌊",
+        page_title="Temporal Geodesic Flow Matching",
+        page_icon="🌀",
         layout="wide",
     )
 
     init_session_state()
 
     # Header
-    st.title("🌊 Flow Matching Explorer")
+    st.title("🌀 Temporal Geodesic Flow Matching")
     st.markdown(
-        "Interactive visualization of flow matching and optimal transport. "
-        "Inspired by [Diffusion Explorer](https://github.com/helblazer811/Diffusion-Explorer)."
+        """
+        **Training on consecutive spectral pairs** — No sampling from noise!
+
+        The model learns to integrate one step: $(\\Phi_t, \\lambda_t) \\rightarrow (\\hat{\\Phi}_{t+1}, \\hat{\\lambda}_{t+1})$
+
+        **Losses**: Grassmann (subspace) + Eigenvalue + Energy regularization
+        """
     )
 
     # Sidebar controls
     with st.sidebar:
-        st.header("Controls")
+        st.header("Data Generation")
 
-        # Flow type selection
-        flow_type = st.selectbox(
-            "Flow Type",
-            options=[
-                "gaussian_to_gaussian",
-                "rotation",
-                "two_moons",
-                "swiss_roll_unroll",
-            ],
+        dataset = st.selectbox(
+            "Dataset",
+            options=["merging_clusters", "evolving_graph"],
             format_func=lambda x: {
-                "gaussian_to_gaussian": "Gaussian → Gaussian (Linear OT)",
-                "rotation": "Rotation (Curved Paths)",
-                "two_moons": "Two Moons",
-                "swiss_roll_unroll": "Swiss Roll Unroll",
+                "merging_clusters": "Merging Clusters",
+                "evolving_graph": "Evolving Graph",
             }.get(x, x),
         )
 
-        # Number of particles
-        n_particles = st.slider("Number of Particles", 50, 500, 200, 50)
+        n_timesteps = st.slider("Timesteps", 20, 100, 50, 10)
+        n_eigenvectors = st.slider("Eigenvectors (k)", 3, 10, 6, 1)
 
-        # Integration steps
-        n_steps = st.slider("Integration Steps", 10, 200, 50, 10)
+        if dataset == "merging_clusters":
+            n_points = st.slider("Points per cluster", 20, 100, 50, 10)
+            separation_start = st.slider("Initial separation", 1.0, 6.0, 3.0, 0.5)
+            data_kwargs = {
+                "n_points": n_points,
+                "separation_start": separation_start,
+                "n_eigenvectors": n_eigenvectors,
+            }
+        else:
+            n_nodes = st.slider("Nodes per ring", 10, 50, 20, 5)
+            data_kwargs = {
+                "n_nodes": n_nodes,
+                "n_eigenvectors": n_eigenvectors,
+            }
 
-        # Visualization options
-        st.subheader("Visualization")
-        show_vector_field = st.checkbox("Show Vector Field", value=False)
-        show_trails = st.checkbox("Show Particle Trails", value=True)
-        trail_length = st.slider("Trail Length", 5, 50, 15, 5) if show_trails else 0
+        st.divider()
+        st.header("Model (Simulated)")
 
-        # Regenerate button
-        if st.button("🔄 Regenerate Samples"):
-            st.session_state.x0 = None
-            st.session_state.trajectory = None
+        noise_level = st.slider("Untrained noise", 0.0, 0.5, 0.15, 0.05)
 
-    # Generate/cache trajectory
-    palette = ColorPalette()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Train +10 epochs"):
+                st.session_state.trained_epochs += 10
+        with col2:
+            if st.button("Reset training"):
+                st.session_state.trained_epochs = 0
+                st.session_state.loss_history = []
 
-    if (
-        st.session_state.x0 is None
-        or st.session_state.velocity_mode != flow_type
-        or len(st.session_state.x0) != n_particles
-    ):
-        with st.spinner("Computing trajectory..."):
-            velocity_fn, _, _ = create_velocity_field(flow_type)
-            x0 = generate_source_samples(flow_type, n_particles)
-            trajectory = integrate_ode(velocity_fn, x0, n_steps=n_steps)
+        st.metric("Trained epochs", st.session_state.trained_epochs)
 
-            st.session_state.x0 = x0
-            st.session_state.trajectory = trajectory
-            st.session_state.velocity_mode = flow_type
+        st.divider()
+        st.header("Loss Weights")
+        grassmann_weight = st.slider("Grassmann weight", 0.0, 2.0, 1.0, 0.1)
+        eigenvalue_weight = st.slider("Eigenvalue weight", 0.0, 2.0, 1.0, 0.1)
+        energy_weight = st.slider("Energy weight", 0.0, 0.1, 0.01, 0.005)
 
-    trajectory = st.session_state.trajectory
-    velocity_fn, _, _ = create_velocity_field(flow_type)
+        st.divider()
+        if st.button("🔄 Regenerate Data"):
+            st.session_state.data = None
+            st.session_state.time_idx = 0
+            st.session_state.loss_history = []
 
-    # Main content area
-    col1, col2 = st.columns([3, 1])
+    # Generate/load data
+    params_hash = f"{dataset}_{n_timesteps}_{n_eigenvectors}_{hash(frozenset(data_kwargs.items()))}"
 
-    with col1:
-        # Time slider
-        t = st.slider(
-            "Time $t$",
-            min_value=0.0,
-            max_value=1.0,
-            value=st.session_state.time,
-            step=0.01,
+    if st.session_state.data is None or st.session_state.params_hash != params_hash:
+        with st.spinner("Generating spectral sequence..."):
+            frames, labels, alignment_data = generate_spectral_sequence(
+                dataset, n_timesteps, **data_kwargs
+            )
+            st.session_state.data = {
+                "frames": frames,
+                "labels": labels,
+                **alignment_data,
+            }
+            st.session_state.params_hash = params_hash
+            st.session_state.time_idx = 0
+            st.session_state.loss_history = []
+
+    data = st.session_state.data
+    Phi_aligned = data["Phi_aligned"]
+    lambda_aligned = data["lambda_aligned"]
+    labels = data["labels"]
+    n_frames = len(Phi_aligned)
+
+    # Time controls
+    st.divider()
+
+    col_slider, col_play, col_reset, col_speed = st.columns([6, 1, 1, 2])
+
+    with col_slider:
+        time_idx = st.slider(
+            "Time step $t$",
+            min_value=0,
+            max_value=n_frames - 2,  # Need t and t+1
+            value=st.session_state.time_idx,
             key="time_slider",
         )
-        st.session_state.time = t
+        st.session_state.time_idx = time_idx
 
-        # Animation controls
-        col_play, col_reset, col_speed = st.columns(3)
+    with col_play:
+        if st.button("▶️" if not st.session_state.playing else "⏸️"):
+            st.session_state.playing = not st.session_state.playing
 
-        with col_play:
-            if st.button("▶️ Play" if not st.session_state.playing else "⏸️ Pause"):
-                st.session_state.playing = not st.session_state.playing
+    with col_reset:
+        if st.button("⏮️"):
+            st.session_state.time_idx = 0
+            st.session_state.playing = False
 
-        with col_reset:
-            if st.button("⏮️ Reset"):
-                st.session_state.time = 0.0
-                st.session_state.playing = False
+    with col_speed:
+        speed = st.select_slider("Speed", options=[0.5, 1.0, 2.0, 4.0], value=1.0)
 
-        with col_speed:
-            speed = st.select_slider(
-                "Speed",
-                options=[0.5, 1.0, 2.0, 4.0],
-                value=1.0,
+    # Get current and next frames
+    Phi_t = Phi_aligned[time_idx]
+    lambda_t = lambda_aligned[time_idx]
+    Phi_tp1_true = Phi_aligned[time_idx + 1]
+    lambda_tp1_true = lambda_aligned[time_idx + 1]
+
+    # Simulate flow prediction
+    prediction = simulate_flow_prediction(
+        Phi_t, lambda_t,
+        Phi_tp1_true, lambda_tp1_true,
+        noise_level=noise_level,
+        trained_epochs=st.session_state.trained_epochs,
+    )
+
+    # Compute losses
+    losses = compute_losses(
+        prediction, Phi_tp1_true, lambda_tp1_true,
+        grassmann_weight=grassmann_weight,
+        eigenvalue_weight=eigenvalue_weight,
+        energy_weight=energy_weight,
+    )
+
+    # Update loss history if training
+    if st.session_state.trained_epochs > len(st.session_state.loss_history):
+        # Simulate training progress
+        for epoch in range(len(st.session_state.loss_history), st.session_state.trained_epochs):
+            pred = simulate_flow_prediction(
+                Phi_t, lambda_t, Phi_tp1_true, lambda_tp1_true,
+                noise_level=noise_level, trained_epochs=epoch,
             )
-
-        # Plot
-        if show_vector_field:
-            fig = plot_vector_field_overlay(
-                velocity_fn, t, trajectory, n_steps, palette
+            epoch_losses = compute_losses(
+                pred, Phi_tp1_true, lambda_tp1_true,
+                grassmann_weight, eigenvalue_weight, energy_weight,
             )
-        else:
-            fig = plot_particles_at_time(
-                trajectory, t, n_steps, palette,
-                show_trails=show_trails,
-                trail_length=trail_length,
-            )
+            st.session_state.loss_history.append(epoch_losses)
 
-        st.pyplot(fig)
-        plt.close(fig)
+    # Main visualization
+    st.divider()
+
+    palette = ColorPalette()
+
+    # Row 1: Flow step visualization
+    st.subheader("One-Step Flow Integration")
+    st.markdown(
+        rf"Integrating from $t={time_idx}$ to $t={time_idx+1}$: "
+        rf"$(\Phi_t, \lambda_t) \rightarrow (\hat{{\Phi}}_{{t+1}}, \hat{{\lambda}}_{{t+1}})$"
+    )
+
+    fig_flow = plot_flow_step(
+        Phi_t, Phi_tp1_true, prediction.Phi_pred,
+        labels=labels, palette=palette,
+        title=f"Flow Step: t={time_idx} → t={time_idx+1}",
+    )
+    st.pyplot(fig_flow)
+    plt.close(fig_flow)
+
+    # Row 2: Three columns - eigenvalues, velocity, losses
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("Eigenvalue Evolution")
+        fig_eigen = plot_eigenvalue_evolution(
+            lambda_aligned,
+            lambda_pred=prediction.lambda_pred,
+            current_idx=time_idx,
+        )
+        st.pyplot(fig_eigen)
+        plt.close(fig_eigen)
 
     with col2:
-        # Info panel
-        st.subheader("Info")
+        st.subheader("Velocity Field")
+        fig_vel = plot_velocity_field(
+            Phi_t, prediction.velocity_Phi,
+            labels=labels, palette=palette,
+            scale=3.0,
+        )
+        st.pyplot(fig_vel)
+        plt.close(fig_vel)
 
-        idx = int(t * len(trajectory))
-        idx = min(idx, len(trajectory) - 1)
-        x_t = trajectory[idx]
-        x_0 = trajectory[0]
-        x_1 = trajectory[-1]
+    with col3:
+        st.subheader("Training Losses")
+        fig_loss = plot_loss_curves(st.session_state.loss_history)
+        st.pyplot(fig_loss)
+        plt.close(fig_loss)
 
-        # Statistics
-        st.metric("Time $t$", f"{t:.3f}")
+    # Loss metrics
+    st.divider()
+    st.subheader("Current Step Losses")
 
-        # Distance metrics
-        if t > 0:
-            displacement = np.mean(np.linalg.norm(x_t - x_0, axis=1))
-            st.metric("Mean Displacement", f"{displacement:.3f}")
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 
-        if t < 1:
-            remaining = np.mean(np.linalg.norm(x_1 - x_t, axis=1))
-            st.metric("Distance to Target", f"{remaining:.3f}")
+    with col_m1:
+        st.metric(
+            "Total Loss",
+            f"{losses.total_loss:.4f}",
+            help="Weighted sum of all losses",
+        )
 
-        # Flow straightness (for Flow Matching this should be ~1)
-        if t > 0.1 and t < 0.9:
-            total_path = np.mean(np.linalg.norm(x_1 - x_0, axis=1))
-            current_path = np.mean(np.linalg.norm(x_t - x_0, axis=1))
-            expected = t * total_path
-            straightness = expected / (current_path + 1e-6)
-            st.metric("Path Straightness", f"{straightness:.3f}")
+    with col_m2:
+        st.metric(
+            "Grassmann Loss",
+            f"{losses.grassmann_loss:.4f}",
+            help="Subspace distance: how far is predicted subspace from true?",
+        )
 
-        st.markdown("---")
+    with col_m3:
+        st.metric(
+            "Eigenvalue Loss",
+            f"{losses.eigenvalue_loss:.4f}",
+            help="MSE between predicted and true eigenvalues",
+        )
+
+    with col_m4:
+        st.metric(
+            "Energy Reg.",
+            f"{losses.energy_regularization:.4f}",
+            help="Penalizes large velocities for stability",
+        )
+
+    # Additional info
+    st.divider()
+
+    with st.expander("Training Paradigm Details", expanded=False):
         st.markdown(
-            """
-            **Legend:**
-            - 🔵 Source distribution ($t=0$)
-            - 🔴 Target distribution ($t=1$)
-            - Colored trails show trajectory history
+            r"""
+            ### Temporal Geodesic Flow Matching
+
+            **Key insight**: We don't sample from noise! Instead, we learn the actual
+            temporal dynamics of spectral embeddings.
+
+            **Training step**:
+            ```
+            train_step(model, Phi_t, lambda_t, Phi_{t+1}, lambda_{t+1}, optimizer)
+            ```
+
+            1. **Forward pass**: Integrate one step from $(\\Phi_t, \\lambda_t)$ to get
+               $(\\hat{\\Phi}_{t+1}, \\hat{\\lambda}_{t+1})$
+
+            2. **Grassmann loss**: Distance between predicted and true *subspaces*
+               $$\\mathcal{L}_\\text{Gr} = d_\\text{Gr}(\\text{span}(\\hat{\\Phi}_{t+1}), \\text{span}(\\Phi_{t+1}))$$
+
+            3. **Eigenvalue loss**: MSE on eigenvalues
+               $$\\mathcal{L}_\\lambda = \\|\\hat{\\lambda}_{t+1} - \\lambda_{t+1}\\|^2$$
+
+            4. **Energy regularization**: Penalize large velocities
+               $$\\mathcal{L}_\\text{reg} = \\|\\dot{\\Phi}\\|_F^2 + \\|\\dot{\\lambda}\\|^2$$
+
+            5. **Backprop** and update model parameters
+
+            **No noise sampling. No reference geodesics.**
             """
         )
 
     # Animation loop
     if st.session_state.playing:
-        new_t = st.session_state.time + 0.02 * speed
-        if new_t >= 1.0:
-            new_t = 0.0
+        new_idx = st.session_state.time_idx + 1
+        if new_idx >= n_frames - 1:
+            new_idx = 0
             st.session_state.playing = False
-        st.session_state.time = new_t
-        time.sleep(0.05)
+        st.session_state.time_idx = new_idx
+        time.sleep(0.1 / speed)
         st.rerun()
-
-
-# =============================================================================
-# Entry Point
-# =============================================================================
 
 
 if __name__ == "__main__":

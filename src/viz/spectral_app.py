@@ -1,9 +1,11 @@
 """
-Streamlit app for Temporal Spectral Alignment visualization.
+Streamlit app for Temporal Geodesic Flow Matching visualization.
 
 Interactive demonstration of how spectral embeddings (Phi, lambda)
-evolve over time and how eigenvalue matching + sign conventions
-keep them aligned.
+evolve over time using the new temporal geodesic flow matching paradigm:
+- Training on consecutive pairs (Phi_t, lambda_t) -> (Phi_{t+1}, lambda_{t+1})
+- Grassmann loss for subspace comparison
+- No sampling from noise - we learn actual temporal dynamics
 
 Usage:
     streamlit run src/viz/spectral_app.py
@@ -24,72 +26,118 @@ except ImportError:
 
 
 def main():
-    """Main entry point for Temporal Spectral Alignment app."""
+    """Main entry point for Temporal Geodesic Flow Matching app."""
     if not STREAMLIT_AVAILABLE:
         print("Streamlit not available. Install with: uv add streamlit")
         return
 
     st.set_page_config(
-        page_title="Temporal Spectral Alignment",
-        page_icon="🌊",
+        page_title="Temporal Geodesic Flow Matching",
+        page_icon="🌀",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
     # Header
-    st.title("Temporal Spectral Alignment")
+    st.title("Temporal Geodesic Flow Matching")
     st.markdown(
         """
-        Interactive visualization of how spectral embeddings evolve over time
-        and how eigenvalue matching + sign conventions maintain consistency.
+        Interactive visualization of spectral dynamics on the Stiefel manifold.
+        **No sampling from noise** — we learn the actual temporal evolution.
         """
     )
 
     st.divider()
 
     # Overview section
-    st.header("Overview")
+    st.header("The New Paradigm")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("The Problem")
+        st.subheader("What Changed")
         st.markdown(
             """
-            Spectral embeddings have **gauge ambiguity**:
+            **Old approach** (standard flow matching):
+            - Sample from noise distribution
+            - Learn to denoise toward target
+            - Reference geodesics between random pairs
 
-            1. **Sign flips**: $\\phi$ and $-\\phi$ are both valid eigenvectors
-            2. **Permutations**: Eigenvalue ordering can change between timesteps
-            3. **Rotations**: Degenerate eigenspaces allow arbitrary rotations
-
-            Naive comparison of eigenvectors across time fails because
-            the "same" geometric mode can appear with different signs
-            or at different indices.
+            **New approach** (temporal geodesic):
+            - Train on consecutive spectral pairs
+            - Learn actual temporal dynamics
+            - No noise, no reference geodesics
             """
         )
 
     with col2:
-        st.subheader("The Solution")
+        st.subheader("Training Step")
+        st.code(
+            """
+train_step(model, Phi_t, lambda_t,
+           Phi_{t+1}, lambda_{t+1}, optimizer)
+
+1. Integrate: (Phi_t, lambda_t) -> (Phi_hat, lambda_hat)
+2. Grassmann loss: d(span(Phi_hat), span(Phi_{t+1}))
+3. Eigenvalue loss: ||lambda_hat - lambda_{t+1}||^2
+4. Energy regularization: ||velocity||^2
+5. Backprop
+            """,
+            language="python",
+        )
+
+    st.divider()
+
+    # Key concepts
+    st.header("Key Concepts")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("Stiefel Manifold")
+        st.markdown(
+            r"""
+            **St(n, k)** = orthonormal k-frames in $\mathbb{R}^n$
+
+            $$\text{St}(n, k) = \{\Phi \in \mathbb{R}^{n \times k} : \Phi^T \Phi = I_k\}$$
+
+            Spectral embeddings $\Phi_t$ live on this manifold.
+            Velocities must be **tangent vectors**.
+            """
+        )
+
+    with col2:
+        st.subheader("Grassmann Distance")
+        st.markdown(
+            r"""
+            **Gr(n, k)** = k-dimensional subspaces of $\mathbb{R}^n$
+
+            Distance based on **principal angles**:
+            $$d_{\text{Gr}}(\mathcal{U}, \mathcal{V}) = \|\sin(\theta_1, ..., \theta_k)\|$$
+
+            Invariant to basis choice within subspace.
+            """
+        )
+
+    with col3:
+        st.subheader("Why This Works")
         st.markdown(
             """
-            **Transport-Consistent Spectral Alignment**:
-
-            1. **Eigenvalue matching**: Use proximity to track modes through crossings
-            2. **Sign conventions**: Canonical rules that don't require node correspondence
-            3. **Temporal stability**: Smooth evolution reveals signal vs noise
-
-            This allows principled comparison of spectral structure across time.
+            - **Geometry-aware**: Respects manifold structure
+            - **Gauge-invariant**: Grassmann loss ignores sign/rotation
+            - **Temporal**: Learns actual dynamics, not denoising
+            - **Extrapolation**: Can predict future states
             """
         )
 
     st.divider()
 
-    # Example pages
+    # Interactive examples
     st.header("Interactive Examples")
 
     st.markdown(
         """
-        Explore two toy examples that demonstrate temporal spectral alignment:
+        Explore two toy examples that demonstrate temporal geodesic flow matching:
         """
     )
 
@@ -102,9 +150,9 @@ def main():
             Two Gaussian clusters gradually merge into one.
 
             **What to watch:**
-            - $\\lambda_2$ (Fiedler value) starts near 0 when clusters are separated
-            - As clusters merge, $\\lambda_2$ increases
-            - Eigenvectors transition from localized to global modes
+            - $\\lambda_2$ (Fiedler value) increases as clusters merge
+            - Model learns to predict subspace evolution
+            - Grassmann loss measures prediction quality
             """
         )
         st.page_link(
@@ -120,9 +168,9 @@ def main():
             Two ring graphs gradually connect via coupling edges.
 
             **What to watch:**
-            - Disconnected rings have degenerate eigenvalues
-            - Coupling creates eigenvalue crossings
-            - New global modes emerge spanning both rings
+            - Eigenvalue crossings as structure changes
+            - Model tracks modes through crossings
+            - One-step integration accuracy
             """
         )
         st.page_link(
@@ -133,52 +181,95 @@ def main():
 
     st.divider()
 
-    # Key concepts
-    st.header("Key Concepts")
+    # Mathematical details
+    st.header("Mathematical Details")
 
-    with st.expander("Eigenvalue Matching", expanded=False):
+    with st.expander("Loss Functions", expanded=False):
         st.markdown(
-            """
-            **Problem**: Eigenvalues can reorder between timesteps (crossings).
+            r"""
+            ### Grassmann Loss (Subspace Distance)
 
-            **Solution**: Use Hungarian algorithm to find optimal matching
-            based on eigenvalue proximity:
+            Given predicted $\hat{\Phi}_{t+1}$ and true $\Phi_{t+1}$, compute
+            principal angles via SVD:
 
-            $$\\min_P \\sum_{i,j} P_{ij} |\\lambda_i^{(t)} - \\lambda_j^{(t+1)}|$$
+            $$\hat{\Phi}_{t+1}^T \Phi_{t+1} = U \Sigma V^T$$
 
-            The permutation $P$ tells us which mode at time $t$ corresponds
-            to which mode at time $t+1$.
+            The diagonal of $\Sigma$ contains $\cos(\theta_i)$ for principal angles.
+            Grassmann distance:
+
+            $$\mathcal{L}_{\text{Gr}} = \|\sin(\theta_1, ..., \theta_k)\|_2$$
+
+            ### Eigenvalue Loss
+
+            Simple MSE on eigenvalues:
+
+            $$\mathcal{L}_\lambda = \frac{1}{k} \sum_{i=1}^k (\hat{\lambda}_i - \lambda_i)^2$$
+
+            ### Energy Regularization
+
+            Penalize large velocities for stability:
+
+            $$\mathcal{L}_{\text{reg}} = \|\dot{\Phi}\|_F^2 + \|\dot{\lambda}\|^2$$
             """
         )
 
-    with st.expander("Sign Conventions", expanded=False):
+    with st.expander("Stiefel Geometry", expanded=False):
         st.markdown(
-            """
-            **Problem**: Eigenvectors are only defined up to sign.
+            r"""
+            ### Tangent Space
 
-            **Solution**: Canonical sign rule based on spectral statistics
-            (not node coordinates):
+            At $\Phi \in \text{St}(n, k)$, the tangent space is:
 
-            - **Max entry positive**: Sign of maximum absolute entry is positive
-            - **Sum positive**: Total sum of entries is non-negative
-            - **Moment-based**: Use third moment (skewness) to break symmetry
+            $$T_\Phi \text{St}(n, k) = \{V : \Phi^T V + V^T \Phi = 0\}$$
 
-            These rules give consistent signs without requiring node-to-node
-            correspondence between graphs.
+            To project arbitrary $V$ to tangent space:
+
+            $$V_{\text{tan}} = V - \Phi \cdot \text{sym}(\Phi^T V)$$
+
+            where $\text{sym}(A) = (A + A^T)/2$.
+
+            ### Retraction
+
+            QR retraction maps tangent vector back to manifold:
+
+            $$R_\Phi(V) = \text{qf}(\Phi + V)$$
+
+            where $\text{qf}$ extracts the Q factor from QR decomposition.
+
+            ### Integration
+
+            One step of flow integration:
+
+            $$\Phi_{t+1} = R_{\Phi_t}(v_\theta(\Phi_t, t) \cdot \Delta t)$$
             """
         )
 
-    with st.expander("Temporal Stability", expanded=False):
+    with st.expander("Why Not Standard Flow Matching?", expanded=False):
         st.markdown(
-            """
-            **Key insight**: Stable modes across time represent signal;
-            volatile modes represent noise.
+            r"""
+            ### Standard Flow Matching
 
-            By tracking eigenvalue and eigenvector stability, we can:
+            In standard flow matching (e.g., for images):
+            1. Sample source $x_0 \sim p_0$ (e.g., noise)
+            2. Sample target $x_1 \sim p_1$ (e.g., data)
+            3. Construct reference path $x_t = (1-t)x_0 + t x_1$
+            4. Train velocity field to match $\dot{x}_t$
 
-            1. Identify the **Temporal Intrinsic Dimension (TID)**
-            2. Separate geometric structure from sampling noise
-            3. Learn smooth flows on the Stiefel manifold
+            ### Why This Doesn't Work Here
+
+            For temporal spectral data:
+            - We have **ordered sequences** $(\\Phi_0, \\Phi_1, ..., \\Phi_T)$
+            - Consecutive pairs are **already coupled** by temporal dynamics
+            - We want to learn the **actual evolution**, not interpolation
+            - Sampling random pairs destroys temporal structure
+
+            ### Our Approach
+
+            Instead of noise → target, we learn:
+            - **Consecutive pair dynamics**: $(\\Phi_t, \\lambda_t) \\to (\\Phi_{t+1}, \\lambda_{t+1})$
+            - Model predicts one-step evolution
+            - Loss compares predicted vs true next state
+            - No artificial interpolation needed
             """
         )
 
