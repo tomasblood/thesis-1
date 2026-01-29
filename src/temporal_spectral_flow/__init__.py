@@ -1,13 +1,14 @@
 """
-Temporal Spectral Flow with Transport-Consistent Alignment.
+Temporal Spectral Flow for Spectral Dynamics.
 
-A framework for learning dynamical models of how the intrinsic geometric structure
-of high-dimensional data evolves over time.
+A framework for learning continuous-time vector fields that model how spectral
+representations evolve over time on the Stiefel manifold.
 
 Key concepts:
-- Maps temporal snapshots to spectral representations on the Stiefel manifold
-- Learns smooth flows representing temporal dynamics
-- Uses optimal transport for alignment during training
+- Maps temporal snapshots to spectral representations (Phi, lambda) on St(N,k) x R^k
+- Learns smooth flows via endpoint prediction with Grassmann-invariant loss
+- NO alignment during training - uses raw consecutive pairs
+- Integrates learned field with QR retraction for manifold-aware dynamics
 - Computes Temporal Intrinsic Dimension (TID) to identify stable modes
 """
 
@@ -107,6 +108,44 @@ def __getattr__(name):
                 f"Install with: pip install torch\nOriginal error: {e}"
             ) from e
 
+    # Grassmann-invariant losses (require PyTorch)
+    elif name == "principal_angle_loss":
+        try:
+            from temporal_spectral_flow.losses import principal_angle_loss
+            return principal_angle_loss
+        except ImportError as e:
+            raise ImportError(
+                f"principal_angle_loss requires PyTorch. "
+                f"Install with: pip install torch\nOriginal error: {e}"
+            ) from e
+    elif name == "projection_loss":
+        try:
+            from temporal_spectral_flow.losses import projection_loss
+            return projection_loss
+        except ImportError as e:
+            raise ImportError(
+                f"projection_loss requires PyTorch. "
+                f"Install with: pip install torch\nOriginal error: {e}"
+            ) from e
+    elif name == "eigenvalue_mse_loss":
+        try:
+            from temporal_spectral_flow.losses import eigenvalue_mse_loss
+            return eigenvalue_mse_loss
+        except ImportError as e:
+            raise ImportError(
+                f"eigenvalue_mse_loss requires PyTorch. "
+                f"Install with: pip install torch\nOriginal error: {e}"
+            ) from e
+    elif name == "TrainingConfig":
+        try:
+            from temporal_spectral_flow.training import TrainingConfig
+            return TrainingConfig
+        except ImportError as e:
+            raise ImportError(
+                f"TrainingConfig requires PyTorch. "
+                f"Install with: pip install torch\nOriginal error: {e}"
+            ) from e
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -116,18 +155,23 @@ __all__ = [
     "SpectralEmbedding",
     "StiefelManifold",
     "TemporalIntrinsicDimension",
-    # Spectral alignment
+    # Spectral alignment (for analysis only, NOT training)
     "SpectralMatcher",
     "SignConvention",
     "SpectralAligner",
     "AlignedSpectralPair",
-    # Optimal transport
+    # Optimal transport (for analysis only, NOT training)
     "TransportAlignment",
     "BasisAligner",
     # Flow models (require PyTorch)
     "SpectralFlowModel",
     "FlowTrainer",
+    "TrainingConfig",
     "JointSpectralFlow",
     "EigenvalueVelocityField",
     "EigenvectorVelocityField",
+    # Grassmann-invariant losses (require PyTorch)
+    "principal_angle_loss",
+    "projection_loss",
+    "eigenvalue_mse_loss",
 ]

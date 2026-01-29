@@ -1,40 +1,40 @@
 """
-Training pipeline for the spectral flow model.
+Training pipeline for the joint spectral flow model.
 
 This module implements the training loop that:
-1. Uses the inner alignment oracle to generate transport-consistent targets
-2. Trains the outer flow model to match these targets
-3. Ensures the outer flow learns true dynamics, not just alignment
+1. Uses raw consecutive spectral pairs WITHOUT alignment
+2. Trains via endpoint prediction with Grassmann-invariant loss
+3. Integrates the learned vector field from t to t+1
 
-Key principle: The inner alignment provides supervision, but the outer
-flow must learn to predict without alignment at inference time.
+Key principle: NO alignment, canonicalization, or interpolation during training.
+The model learns to predict dynamics on raw spectral data.
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Literal, Optional, Tuple
+from typing import Callable, Optional, Tuple, List
 
 import numpy as np
 from numpy.typing import NDArray
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from loguru import logger
-from einops import rearrange, einsum
-from beartype import beartype
-from jaxtyping import Float, jaxtyped
+from einops import rearrange
 
-from temporal_spectral_flow.flow import SpectralFlowModel, numpy_to_torch, torch_to_numpy
+from temporal_spectral_flow.joint_flow import JointSpectralFlow
 from temporal_spectral_flow.spectral import SpectralSnapshot, TemporalSpectralEmbedding
-from temporal_spectral_flow.stiefel import StiefelManifold
-from temporal_spectral_flow.transport import TransportAlignment, AlignmentResult, BasisAligner
+from temporal_spectral_flow.losses import (
+    principal_angle_loss,
+    eigenvalue_mse_loss,
+    velocity_energy_regularization,
+)
 
 
 @dataclass
 class TrainingConfig:
-    """Configuration for flow training."""
+    """Configuration for joint flow training."""
 
     # Optimization
     learning_rate: float = 1e-4
@@ -44,17 +44,15 @@ class TrainingConfig:
     grad_clip: float = 1.0
 
     # Loss weights
-    velocity_loss_weight: float = 1.0
-    endpoint_loss_weight: float = 0.1
-    regularization_weight: float = 0.01
+    alpha: float = 1.0  # Weight for eigenvalue MSE loss
+    eta: float = 0.0  # Weight for energy regularization (default off)
+    gamma: float = 1.0  # Weight for eigenvector velocity in energy regularization
 
     # Integration
     n_integration_steps: int = 10
 
-    # Alignment
-    alignment_method: str = "unbalanced"
-    alignment_reg: float = 0.1
-    alignment_reg_m: float = 1.0
+    # Dataset options
+    allow_size_mismatch: bool = False  # If True, raise error on size mismatch; if False, filter out
 
     # Logging
     log_interval: int = 10
@@ -71,100 +69,108 @@ class TrainingState:
     epoch: int = 0
     step: int = 0
     best_loss: float = float("inf")
-    losses: list[float] = field(default_factory=list)
-    velocity_losses: list[float] = field(default_factory=list)
-    endpoint_losses: list[float] = field(default_factory=list)
+    losses: List[float] = field(default_factory=list)
+    grassmann_losses: List[float] = field(default_factory=list)
+    eigenvalue_losses: List[float] = field(default_factory=list)
+    energy_losses: List[float] = field(default_factory=list)
 
 
 class TemporalPairDataset(Dataset):
     """
     Dataset of consecutive spectral snapshot pairs.
 
-    Each item is (Phi_t, Phi_{t+1}_aligned, t) where the target
-    has been pre-aligned using the transport oracle.
+    Returns RAW pairs (Phi_t, lambda_t, Phi_next, lambda_next, t_index)
+    WITHOUT any alignment, canonicalization, or sign fixing.
+
+    Size mismatches are filtered out by default.
     """
 
     def __init__(
         self,
-        snapshots: list[SpectralSnapshot],
-        aligner: TransportAlignment,
-        include_eigenvalues: bool = True,
+        snapshots: List[SpectralSnapshot],
+        allow_size_mismatch: bool = False,
     ):
         """
         Initialize dataset.
 
         Args:
-            snapshots: List of spectral snapshots
-            aligner: Transport alignment module
-            include_eigenvalues: Use eigenvalues in alignment cost
+            snapshots: List of spectral snapshots (each has Phi and eigenvalues)
+            allow_size_mismatch: If True, raise error on size mismatch; if False, filter out
         """
         self.snapshots = snapshots
-        self.aligner = aligner
-        self.include_eigenvalues = include_eigenvalues
-
-        # Pre-compute alignments for all consecutive pairs
-        self.pairs = []
-        self.alignment_results = []
-
-        basis_aligner = BasisAligner()
+        self.pairs: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
 
         for t in range(len(snapshots) - 1):
             Phi_t = snapshots[t].Phi
             Phi_next = snapshots[t + 1].Phi
+            lambda_t = snapshots[t].eigenvalues
+            lambda_next = snapshots[t + 1].eigenvalues
 
-            # Handle size mismatch with transport
+            # Check size compatibility
             if Phi_t.shape[0] != Phi_next.shape[0]:
-                # Full transport alignment
-                eig_t = snapshots[t].eigenvalues if include_eigenvalues else None
-                eig_next = snapshots[t + 1].eigenvalues if include_eigenvalues else None
+                if allow_size_mismatch:
+                    raise ValueError(
+                        f"Size mismatch at t={t}: N_t={Phi_t.shape[0]}, N_{{t+1}}={Phi_next.shape[0]}. "
+                        "Set allow_size_mismatch=False to filter out mismatched pairs."
+                    )
+                else:
+                    logger.warning(
+                        f"Skipping pair at t={t} due to size mismatch: "
+                        f"N_t={Phi_t.shape[0]}, N_{{t+1}}={Phi_next.shape[0]}"
+                    )
+                    continue
 
-                result = aligner.align(
-                    Phi_t, Phi_next,
-                    eigenvalues_source=eig_t,
-                    eigenvalues_target=eig_next,
+            # Check spectral dimension compatibility
+            if Phi_t.shape[1] != Phi_next.shape[1]:
+                logger.warning(
+                    f"Skipping pair at t={t} due to k mismatch: "
+                    f"k_t={Phi_t.shape[1]}, k_{{t+1}}={Phi_next.shape[1]}"
                 )
-                Phi_next_aligned = result.aligned_target
-                self.alignment_results.append(result)
-            else:
-                # Same size: just align bases
-                _, Phi_next_aligned = basis_aligner.align_bases(Phi_t, Phi_next)
-                self.alignment_results.append(None)
+                continue
 
+            # Store raw pairs without alignment
             self.pairs.append((
                 Phi_t.astype(np.float32),
-                Phi_next_aligned.astype(np.float32),
-                np.array([t], dtype=np.float32),
+                lambda_t.astype(np.float32),
+                Phi_next.astype(np.float32),
+                lambda_next.astype(np.float32),
+                np.array([float(t)], dtype=np.float32),
             ))
+
+        logger.info(f"Created dataset with {len(self.pairs)} valid pairs from {len(snapshots)} snapshots")
 
     def __len__(self) -> int:
         return len(self.pairs)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Phi_t, Phi_next, t = self.pairs[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        Phi_t, lambda_t, Phi_next, lambda_next, t_idx = self.pairs[idx]
         return (
             torch.from_numpy(Phi_t),
+            torch.from_numpy(lambda_t),
             torch.from_numpy(Phi_next),
-            torch.from_numpy(t),
+            torch.from_numpy(lambda_next),
+            torch.from_numpy(t_idx),
         )
 
 
 class FlowTrainer:
     """
-    Trainer for the spectral flow model.
+    Trainer for the joint spectral flow model.
 
-    Manages the training loop, loss computation, and checkpointing.
+    Uses endpoint prediction with Grassmann-invariant loss for eigenvectors
+    and Euclidean MSE for eigenvalues. No alignment during training.
     """
 
     def __init__(
         self,
-        model: SpectralFlowModel,
+        model: JointSpectralFlow,
         config: Optional[TrainingConfig] = None,
     ):
         """
         Initialize trainer.
 
         Args:
-            model: SpectralFlowModel to train
+            model: JointSpectralFlow model to train
             config: Training configuration
         """
         self.model = model
@@ -185,120 +191,15 @@ class FlowTrainer:
             T_max=self.config.n_epochs,
         )
 
-        self.aligner = TransportAlignment(
-            method=self.config.alignment_method,
-            reg=self.config.alignment_reg,
-            reg_m=self.config.alignment_reg_m,
-        )
-
-    def compute_velocity_loss(
-        self,
-        Phi_t: torch.Tensor,
-        Phi_next_aligned: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute loss between predicted and target velocities.
-
-        Target velocity is the geodesic/log-map displacement from
-        Phi_t to Phi_{t+1}^{aligned}.
-
-        Args:
-            Phi_t: Current spectral embedding (batch, N, k)
-            Phi_next_aligned: Aligned next embedding (batch, N, k)
-            t: Time values (batch,)
-
-        Returns:
-            Velocity matching loss
-        """
-        # Predict velocity
-        v_pred = self.model.predict_velocity(Phi_t, t)
-
-        # Target velocity: simple difference (projected to tangent space)
-        # For small timesteps, this approximates the log map
-        v_target = Phi_next_aligned - Phi_t
-
-        # Project target to tangent space at Phi_t
-        v_target = self._project_to_tangent_batch(Phi_t, v_target)
-
-        # MSE loss
-        loss = torch.mean((v_pred - v_target) ** 2)
-
-        return loss
-
-    def compute_endpoint_loss(
-        self,
-        Phi_t: torch.Tensor,
-        Phi_next_aligned: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute loss on integrated endpoint.
-
-        Args:
-            Phi_t: Current embedding
-            Phi_next_aligned: Target aligned embedding
-            t: Time
-
-        Returns:
-            Endpoint matching loss
-        """
-        # Integrate from t to t+1
-        t_end = t + 1.0
-
-        Phi_pred = self.model(
-            Phi_t, t, t_end,
-            n_steps=self.config.n_integration_steps,
-        )
-
-        # Geodesic distance (approximated by Frobenius norm)
-        loss = torch.mean((Phi_pred - Phi_next_aligned) ** 2)
-
-        return loss
-
-    def compute_regularization_loss(
-        self,
-        Phi_t: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Regularization on velocity field smoothness.
-
-        Penalizes high velocity magnitudes for stability.
-        """
-        v = self.model.predict_velocity(Phi_t, t)
-        return torch.mean(v ** 2)
-
-    @jaxtyped(typechecker=beartype)
-    def _project_to_tangent_batch(
-        self,
-        Phi: Float[torch.Tensor, "batch n k"],
-        V: Float[torch.Tensor, "batch n k"],
-    ) -> Float[torch.Tensor, "batch n k"]:
-        """
-        Project V to tangent space at Phi (batched).
-
-        Args:
-            Phi: Points on Stiefel (batch, N, k)
-            V: Vectors to project (batch, N, k)
-
-        Returns:
-            Projected tangent vectors
-        """
-        # V_tan = V - Phi @ sym(Phi^T @ V)
-        PhiTV = einsum(Phi, V, 'b n k, b n l -> b k l')  # (batch, k, k)
-        sym_PhiTV = (PhiTV + rearrange(PhiTV, 'b i j -> b j i')) / 2
-        return V - einsum(Phi, sym_PhiTV, 'b n k, b k l -> b n l')
-
     def train_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> dict[str, float]:
         """
-        Single training step.
+        Single training step using endpoint prediction.
 
         Args:
-            batch: (Phi_t, Phi_next_aligned, t)
+            batch: (Phi_t, lambda_t, Phi_next, lambda_next, t_idx)
 
         Returns:
             Dictionary of loss values
@@ -306,21 +207,46 @@ class FlowTrainer:
         self.model.train()
         self.optimizer.zero_grad()
 
-        Phi_t, Phi_next_aligned, t = batch
+        Phi_t, lambda_t, Phi_next, lambda_next, t_idx = batch
         Phi_t = Phi_t.to(self.device)
-        Phi_next_aligned = Phi_next_aligned.to(self.device)
-        t = rearrange(t, 'b 1 -> b').to(self.device)
+        lambda_t = lambda_t.to(self.device)
+        Phi_next = Phi_next.to(self.device)
+        lambda_next = lambda_next.to(self.device)
+        t_idx = rearrange(t_idx, 'b 1 -> b').to(self.device)
 
-        # Compute losses
-        velocity_loss = self.compute_velocity_loss(Phi_t, Phi_next_aligned, t)
-        endpoint_loss = self.compute_endpoint_loss(Phi_t, Phi_next_aligned, t)
-        reg_loss = self.compute_regularization_loss(Phi_t, t)
+        batch_size = Phi_t.shape[0]
 
-        # Total loss
+        # Integrate from t to t+1
+        lambda_pred, Phi_pred = self.model.integrate(
+            lambda_t,
+            Phi_t,
+            t_start=0.0,  # Normalized time: 0 -> 1 for one step
+            t_end=1.0,
+            n_steps=self.config.n_integration_steps,
+        )
+
+        # Grassmann-invariant loss for eigenvectors (principal angles)
+        grassmann_loss = principal_angle_loss(Phi_pred, Phi_next)
+
+        # Euclidean MSE for eigenvalues
+        eigenvalue_loss = eigenvalue_mse_loss(lambda_pred, lambda_next)
+
+        # Optional energy regularization
+        if self.config.eta > 0:
+            # Compute velocity at start time for regularization
+            t_start = torch.zeros(batch_size, device=self.device)
+            v_lambda, v_Phi = self.model.velocity(lambda_t, Phi_t, t_start)
+            energy_loss = velocity_energy_regularization(
+                v_lambda, v_Phi, gamma=self.config.gamma
+            )
+        else:
+            energy_loss = torch.tensor(0.0, device=self.device)
+
+        # Total loss: L = L_G + alpha * L_lambda + eta * L_energy
         total_loss = (
-            self.config.velocity_loss_weight * velocity_loss +
-            self.config.endpoint_loss_weight * endpoint_loss +
-            self.config.regularization_weight * reg_loss
+            grassmann_loss +
+            self.config.alpha * eigenvalue_loss +
+            self.config.eta * energy_loss
         )
 
         # Backward pass
@@ -337,9 +263,9 @@ class FlowTrainer:
 
         return {
             "total_loss": total_loss.item(),
-            "velocity_loss": velocity_loss.item(),
-            "endpoint_loss": endpoint_loss.item(),
-            "reg_loss": reg_loss.item(),
+            "grassmann_loss": grassmann_loss.item(),
+            "eigenvalue_loss": eigenvalue_loss.item(),
+            "energy_loss": energy_loss.item() if isinstance(energy_loss, torch.Tensor) else energy_loss,
         }
 
     def train_epoch(
@@ -357,7 +283,12 @@ class FlowTrainer:
         Returns:
             Average losses for the epoch
         """
-        total_losses = {"total_loss": 0, "velocity_loss": 0, "endpoint_loss": 0, "reg_loss": 0}
+        total_losses = {
+            "total_loss": 0.0,
+            "grassmann_loss": 0.0,
+            "eigenvalue_loss": 0.0,
+            "energy_loss": 0.0,
+        }
         n_batches = 0
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
@@ -370,20 +301,21 @@ class FlowTrainer:
 
             pbar.set_postfix({
                 "loss": f"{losses['total_loss']:.4f}",
-                "v_loss": f"{losses['velocity_loss']:.4f}",
+                "G": f"{losses['grassmann_loss']:.4f}",
+                "λ": f"{losses['eigenvalue_loss']:.4f}",
             })
 
             self.state.step += 1
 
         # Average losses
-        avg_losses = {k: v / n_batches for k, v in total_losses.items()}
+        avg_losses = {k: v / max(n_batches, 1) for k, v in total_losses.items()}
         return avg_losses
 
     def train(
         self,
-        snapshots: list[SpectralSnapshot],
-        val_snapshots: Optional[list[SpectralSnapshot]] = None,
-        callbacks: Optional[list[Callable]] = None,
+        snapshots: List[SpectralSnapshot],
+        val_snapshots: Optional[List[SpectralSnapshot]] = None,
+        callbacks: Optional[List[Callable]] = None,
     ) -> TrainingState:
         """
         Full training loop.
@@ -396,8 +328,11 @@ class FlowTrainer:
         Returns:
             Final training state
         """
-        # Create dataset and dataloader
-        dataset = TemporalPairDataset(snapshots, self.aligner)
+        # Create dataset and dataloader (NO alignment)
+        dataset = TemporalPairDataset(
+            snapshots,
+            allow_size_mismatch=self.config.allow_size_mismatch,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
@@ -405,9 +340,15 @@ class FlowTrainer:
             num_workers=0,
         )
 
+        if len(dataset) == 0:
+            raise ValueError("Dataset is empty. Check that snapshots have consistent sizes.")
+
         # Validation data
         if val_snapshots is not None:
-            val_dataset = TemporalPairDataset(val_snapshots, self.aligner)
+            val_dataset = TemporalPairDataset(
+                val_snapshots,
+                allow_size_mismatch=self.config.allow_size_mismatch,
+            )
             val_dataloader = DataLoader(val_dataset, batch_size=self.config.batch_size)
         else:
             val_dataloader = None
@@ -419,8 +360,9 @@ class FlowTrainer:
             # Train
             train_losses = self.train_epoch(dataloader, epoch)
             self.state.losses.append(train_losses["total_loss"])
-            self.state.velocity_losses.append(train_losses["velocity_loss"])
-            self.state.endpoint_losses.append(train_losses["endpoint_loss"])
+            self.state.grassmann_losses.append(train_losses["grassmann_loss"])
+            self.state.eigenvalue_losses.append(train_losses["eigenvalue_loss"])
+            self.state.energy_losses.append(train_losses["energy_loss"])
 
             # Validation
             if val_dataloader is not None:
@@ -430,7 +372,10 @@ class FlowTrainer:
                     f"val_loss={val_loss:.4f}"
                 )
             else:
-                logger.info(f"Epoch {epoch}: train_loss={train_losses['total_loss']:.4f}")
+                logger.info(
+                    f"Epoch {epoch}: loss={train_losses['total_loss']:.4f}, "
+                    f"G={train_losses['grassmann_loss']:.4f}, λ={train_losses['eigenvalue_loss']:.4f}"
+                )
 
             # Update best loss
             if train_losses["total_loss"] < self.state.best_loss:
@@ -446,6 +391,7 @@ class FlowTrainer:
 
         return self.state
 
+    @torch.no_grad()
     def evaluate(
         self,
         dataloader: DataLoader,
@@ -460,21 +406,34 @@ class FlowTrainer:
             Average loss
         """
         self.model.eval()
-        total_loss = 0
+        total_loss = 0.0
         n_batches = 0
 
-        with torch.no_grad():
-            for batch in dataloader:
-                Phi_t, Phi_next_aligned, t = batch
-                Phi_t = Phi_t.to(self.device)
-                Phi_next_aligned = Phi_next_aligned.to(self.device)
-                t = rearrange(t, 'b 1 -> b').to(self.device)
+        for batch in dataloader:
+            Phi_t, lambda_t, Phi_next, lambda_next, t_idx = batch
+            Phi_t = Phi_t.to(self.device)
+            lambda_t = lambda_t.to(self.device)
+            Phi_next = Phi_next.to(self.device)
+            lambda_next = lambda_next.to(self.device)
 
-                velocity_loss = self.compute_velocity_loss(Phi_t, Phi_next_aligned, t)
-                total_loss += velocity_loss.item()
-                n_batches += 1
+            # Integrate
+            lambda_pred, Phi_pred = self.model.integrate(
+                lambda_t,
+                Phi_t,
+                t_start=0.0,
+                t_end=1.0,
+                n_steps=self.config.n_integration_steps,
+            )
 
-        return total_loss / n_batches
+            # Losses
+            grassmann_loss = principal_angle_loss(Phi_pred, Phi_next)
+            eigenvalue_loss = eigenvalue_mse_loss(lambda_pred, lambda_next)
+            loss = grassmann_loss + self.config.alpha * eigenvalue_loss
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        return total_loss / max(n_batches, 1)
 
     def save_checkpoint(self, path: Path) -> None:
         """Save model and training state."""
@@ -496,13 +455,13 @@ class FlowTrainer:
 
 
 def train_from_data(
-    data_snapshots: list[NDArray[np.floating]],
+    data_snapshots: List[NDArray[np.floating]],
     k: int = 10,
     config: Optional[TrainingConfig] = None,
     **embedding_kwargs,
-) -> Tuple[SpectralFlowModel, FlowTrainer, list[SpectralSnapshot]]:
+) -> Tuple[JointSpectralFlow, FlowTrainer, List[SpectralSnapshot]]:
     """
-    Convenience function to train a flow model from raw data.
+    Convenience function to train a joint flow model from raw data.
 
     Args:
         data_snapshots: List of data matrices (N_t, d) for each time t
@@ -517,10 +476,11 @@ def train_from_data(
     embedder = TemporalSpectralEmbedding(k=k, **embedding_kwargs)
     snapshots = embedder.process_sequence(data_snapshots)
 
-    # Create model
-    model = SpectralFlowModel(k=k)
+    # Create JointSpectralFlow model (NOT SpectralFlowModel)
+    model = JointSpectralFlow(k=k)
 
     # Create trainer
+    config = config or TrainingConfig()
     trainer = FlowTrainer(model, config)
 
     # Train

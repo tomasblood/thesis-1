@@ -8,17 +8,14 @@ The flow is conditioned on eigenvalues - eigenvector dynamics depend on
 the geometric scales present.
 """
 
-from typing import Optional, Tuple, Literal, List
-import numpy as np
-from numpy.typing import NDArray
+from typing import Tuple, Literal, List
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange, einsum
 from beartype import beartype
 from jaxtyping import Float, jaxtyped
 
-from temporal_spectral_flow.stiefel import StiefelManifold
 from temporal_spectral_flow.flow import SinusoidalTimeEmbedding
 
 
@@ -89,6 +86,8 @@ class EigenvalueVelocityField(nn.Module):
 
         if t.dim() == 0:
             t = rearrange(t, '-> 1').expand(batch_size)
+        elif t.shape[0] == 1 and batch_size > 1:
+            t = t.expand(batch_size)
 
         t_embed = self.time_embed(t)
 
@@ -188,6 +187,8 @@ class EigenvectorVelocityField(nn.Module):
 
         if t.dim() == 0:
             t = rearrange(t, '-> 1').expand(batch_size)
+        elif t.shape[0] == 1 and batch_size > 1:
+            t = t.expand(batch_size)
 
         # Embeddings
         t_embed = self.time_embed(t)  # (batch, time_embed_dim)
@@ -420,7 +421,7 @@ class JointSpectralFlow(nn.Module):
         return Q
 
 
-def compute_flow_matching_loss(
+def _deprecated_compute_flow_matching_loss(
     model: JointSpectralFlow,
     lambda_source: torch.Tensor,
     Phi_source: torch.Tensor,
@@ -429,68 +430,21 @@ def compute_flow_matching_loss(
     t: torch.Tensor,
 ) -> Tuple[torch.Tensor, dict]:
     """
-    Compute flow matching loss for training.
+    DEPRECATED: Do not use in training.
 
-    Target velocities are computed from aligned source-target pairs.
+    This function violates the continuous-time vector field spec because it:
+    - Samples t in [0, 1] for bridge interpolation
+    - Interpolates between source and target
+    - Requires pre-aligned pairs
 
-    Args:
-        model: JointSpectralFlow model
-        lambda_source: Source eigenvalues (batch, k)
-        Phi_source: Source eigenvectors (batch, N, k)
-        lambda_target: Aligned target eigenvalues (batch, k)
-        Phi_target: Aligned target eigenvectors (batch, N, k)
-        t: Interpolation time (batch,), values in [0, 1]
-
-    Returns:
-        loss: Scalar loss
-        metrics: Dictionary of component losses
+    Use endpoint prediction with Grassmann-invariant loss instead.
+    See training.py for the correct training procedure.
     """
-    batch_size = lambda_source.shape[0]
-
-    # Interpolate to time t
-    # Linear interpolation for eigenvalues
-    t_expanded = rearrange(t, 'b -> b 1')
-    lambda_t = (1 - t_expanded) * lambda_source + t_expanded * lambda_target
-
-    # For eigenvectors, we should use geodesic interpolation
-    # Approximate with linear + retraction for simplicity
-    t_expanded_phi = rearrange(t, 'b -> b 1 1')
-    Phi_t_linear = (1 - t_expanded_phi) * Phi_source + t_expanded_phi * Phi_target
-
-    # Retract to Stiefel
-    Phi_t = []
-    for i in range(batch_size):
-        Q, R = torch.linalg.qr(Phi_t_linear[i])
-        signs = torch.sign(torch.diag(R))
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        Phi_t.append(Q * rearrange(signs, 'k -> 1 k'))
-    Phi_t = torch.stack(Phi_t)
-
-    # Predict velocity at interpolated point
-    v_lambda_pred, v_Phi_pred = model.velocity(lambda_t, Phi_t, t)
-
-    # Target velocity: direction to target
-    # For eigenvalues: simple difference
-    v_lambda_target = lambda_target - lambda_source
-
-    # For eigenvectors: difference projected to tangent space
-    v_Phi_target = Phi_target - Phi_source
-    # Project to tangent space at Phi_t
-    v_Phi_target = _project_to_tangent_batch(Phi_t, v_Phi_target)
-
-    # Losses
-    loss_lambda = F.mse_loss(v_lambda_pred, v_lambda_target)
-    loss_Phi = F.mse_loss(v_Phi_pred, v_Phi_target)
-
-    loss = loss_lambda + loss_Phi
-
-    metrics = {
-        "loss_total": loss.item(),
-        "loss_lambda": loss_lambda.item(),
-        "loss_Phi": loss_Phi.item(),
-    }
-
-    return loss, metrics
+    raise NotImplementedError(
+        "compute_flow_matching_loss is deprecated. "
+        "Use endpoint prediction with principal_angle_loss instead. "
+        "See training.py for the correct training procedure."
+    )
 
 
 @jaxtyped(typechecker=beartype)
